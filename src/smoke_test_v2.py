@@ -1,6 +1,7 @@
 """Offline smoke test for the v2 modules (no network, no GHSL download)."""
 
 import math
+import os
 
 import numpy as np
 
@@ -272,6 +273,72 @@ def test_verifier_regressions():
     print("verifier regressions R1-R4 ok")
 
 
+class _FakeTile:
+    """Sliceable stand-in for a GHSL tile with a constant value."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __getitem__(self, idx):
+        ys, xs = idx
+        h = (ys.stop or 0) - (ys.start or 0)
+        w = (xs.stop or 0) - (xs.start or 0)
+        return np.full((h, w), self.value, dtype=np.uint16)
+
+
+def test_windowed_density_and_resume():
+    """Windowed GHSL sampling math + per-town resume caching (offline)."""
+    import shutil
+    import tempfile
+    import data
+    import data_v2
+
+    # windowed read: constant tile of half the cell area -> density 0.5
+    lat, lon = 46.5, 8.0
+    val = int(data_v2.cell_area_m2(lat) * 0.5)
+    orig = data_v2._get_tile
+    data_v2._get_tile = lambda *a, **k: _FakeTile(val)
+    try:
+        dens = data_v2.sample_density(lat, lon, 2020)
+        assert dens.shape == (GRID, GRID)
+        assert abs(float(dens.mean()) - 0.5) < 0.02, dens.mean()
+    finally:
+        data_v2._get_tile = orig
+
+    # resume: run build_dataset twice with mocked fetching; second run must
+    # come entirely from cache and produce identical output
+    rng = np.random.default_rng(4)
+    elev = data.fractal_heightmap(rng)
+    fake_sample = (np.zeros((4, GRID, GRID), np.float32),
+                   np.zeros((2, GRID, GRID), np.float32))
+    calls = {"n": 0}
+
+    def fake_windows(town, jitter, sess, overpass_sem=None):
+        calls["n"] += 1
+        return [fake_sample]
+
+    towns = [("Testville", "XX", 46.0, 8.0, "test"),
+             ("Mockham", "YY", 47.0, 9.0, "test")]
+    tmp = tempfile.mkdtemp()
+    orig_windows = data._town_windows
+    data._town_windows = fake_windows
+    try:
+        out1 = os.path.join(tmp, "d1.npz")
+        out2 = os.path.join(tmp, "d2.npz")
+        cache = os.path.join(tmp, "towns")
+        data.build_dataset(towns, out1, verbose=False, cache_dir=cache)
+        n_first = calls["n"]
+        data.build_dataset(towns, out2, verbose=False, cache_dir=cache)
+        assert calls["n"] == n_first, "second run must not refetch"
+        d1 = np.load(out1, allow_pickle=True)
+        d2 = np.load(out2, allow_pickle=True)
+        assert d1["cond"].shape == d2["cond"].shape == (16, 4, GRID, GRID)
+    finally:
+        data._town_windows = orig_windows
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("windowed density + resume ok")
+
+
 if __name__ == "__main__":
     test_tile_math()
     test_make_sample_v2()
@@ -279,4 +346,5 @@ if __name__ == "__main__":
     test_sustainability()
     test_acceptance_v2()
     test_verifier_regressions()
+    test_windowed_density_and_resume()
     print("all v2 smoke tests passed")

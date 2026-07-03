@@ -67,24 +67,58 @@ def _tile_path(cache_dir, epoch, r, c):
     return os.path.join(cache_dir, f"ghsl_E{epoch}_R{r}_C{c}.tif")
 
 
-def load_tile(epoch, r, c, cache_dir="ghsl_cache", session=None):
-    """Download (once) and open a GHSL tile. Returns a 2D uint16 array."""
+_TILE_LOCKS = {}
+_TILE_LOCKS_GUARD = None  # created lazily to keep import light
+
+
+def _tile_lock(key):
+    import threading
+    global _TILE_LOCKS_GUARD
+    if _TILE_LOCKS_GUARD is None:
+        _TILE_LOCKS_GUARD = threading.Lock()
+    with _TILE_LOCKS_GUARD:
+        if key not in _TILE_LOCKS:
+            _TILE_LOCKS[key] = threading.Lock()
+        return _TILE_LOCKS[key]
+
+
+def _ensure_tile_file(epoch, r, c, cache_dir, session=None):
+    """Download a GHSL tile once (thread-safe). Returns the local path."""
     import requests
-    import tifffile
     os.makedirs(cache_dir, exist_ok=True)
     path = _tile_path(cache_dir, epoch, r, c)
-    if not os.path.exists(path):
-        session = session or requests.Session()
-        url = GHSL_URL.format(epoch=epoch, r=r, c=c)
-        resp = session.get(url, timeout=300)
-        resp.raise_for_status()
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            tif_names = [n for n in zf.namelist() if n.endswith(".tif")]
-            if not tif_names:
-                raise RuntimeError(f"no .tif inside {url}")
-            with zf.open(tif_names[0]) as fh, open(path, "wb") as out:
-                out.write(fh.read())
-    return tifffile.imread(path)
+    with _tile_lock((epoch, r, c)):
+        if not os.path.exists(path):
+            session = session or requests.Session()
+            url = GHSL_URL.format(epoch=epoch, r=r, c=c)
+            resp = session.get(url, timeout=300)
+            resp.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                tif_names = [n for n in zf.namelist() if n.endswith(".tif")]
+                if not tif_names:
+                    raise RuntimeError(f"no .tif inside {url}")
+                with zf.open(tif_names[0]) as fh, open(path + ".part", "wb") as out:
+                    out.write(fh.read())
+            os.replace(path + ".part", path)
+    return path
+
+
+def _open_tile(path):
+    """Open a tile for WINDOWED reads (zarr view over the tiled TIFF), so a
+    ~20 px town window doesn't materialise a 288 MB array. Falls back to a
+    full read if zarr is unavailable."""
+    import tifffile
+    try:
+        import zarr
+        return zarr.open(tifffile.imread(path, aszarr=True), mode="r")
+    except Exception:  # noqa: BLE001 - zarr missing or non-tiled tif
+        return tifffile.imread(path)
+
+
+def load_tile(epoch, r, c, cache_dir="ghsl_cache", session=None):
+    """Download (once) and open a GHSL tile. Returns a sliceable 2D array
+    (zarr view or ndarray)."""
+    return _open_tile(_ensure_tile_file(epoch, r, c, cache_dir, session))
 
 
 def cell_area_m2(lat):
@@ -93,52 +127,49 @@ def cell_area_m2(lat):
     return step_m * step_m * max(math.cos(math.radians(lat)), 0.05)
 
 
+def _get_tile(epoch, r, c, cache_dir, session, _tile_cache):
+    key = (epoch, r, c)
+    if _tile_cache is not None and key in _tile_cache:
+        return _tile_cache[key]
+    arr = load_tile(epoch, r, c, cache_dir, session)
+    if _tile_cache is not None:
+        _tile_cache[key] = arr
+    return arr
+
+
 def sample_density(lat, lon, epoch, cache_dir="ghsl_cache", session=None,
                    _tile_cache=None):
     """GRID x GRID built-up *fraction* in [0, 1] for the window around
-    (lat, lon) at the given epoch. Mosaics up to 4 tiles if the window
-    crosses tile borders."""
+    (lat, lon) at the given epoch. Reads only the ~20 px patch the window
+    needs (windowed zarr slice), mosaicking across tile borders if hit."""
     s, w, n, e = window_bbox(lat, lon)
-    corners = [(n, w), (n, e), (s, w), (s, e)]
-    rcs = sorted({ghsl_tile_rc(la, lo) for la, lo in corners})
-    tiles = {}
-    for r, c in rcs:
-        key = (epoch, r, c)
-        if _tile_cache is not None and key in _tile_cache:
-            tiles[(r, c)] = _tile_cache[key]
-        else:
-            arr = load_tile(epoch, r, c, cache_dir, session)
-            tiles[(r, c)] = arr
-            if _tile_cache is not None:
-                _tile_cache[key] = arr
-
     deg_px = TILE_DEG / TILE_PX
-
-    def read_patch():
-        # bounding box in global fractional pixel coords of the row/col grid
-        rows = sorted({rc[0] for rc in rcs})
-        cols = sorted({rc[1] for rc in rcs})
-        north0, west0 = tile_origin(rows[0], cols[0])
-        h = TILE_PX * len(rows)
-        wpx = TILE_PX * len(cols)
-        mosaic = np.zeros((h, wpx), dtype=np.float32)
-        for (r, c), arr in tiles.items():
-            i = (r - rows[0]) * TILE_PX
-            j = (c - cols[0]) * TILE_PX
-            a = arr.astype(np.float32)
-            a[a == NODATA] = 0.0
-            mosaic[i:i + TILE_PX, j:j + TILE_PX] = a
-        y0 = (north0 - n) / deg_px
-        y1 = (north0 - s) / deg_px
-        x0 = (w - west0) / deg_px
-        x1 = (e - west0) / deg_px
-        im = Image.fromarray(mosaic, mode="F")
-        win = im.transform((GRID, GRID), Image.QUAD,
-                           (x0, y0, x0, y1, x1, y1, x1, y0),
-                           resample=Image.BILINEAR)
-        return np.asarray(win, dtype=np.float32)
-
-    dens = read_patch() / cell_area_m2(lat)
+    # global fractional pixel coords: x east from 180W, y south from 90N
+    gx0, gx1 = (w + 180.0) / deg_px, (e + 180.0) / deg_px
+    gy0, gy1 = (90.0 - n) / deg_px, (90.0 - s) / deg_px
+    ix0, iy0 = int(gx0) - 2, int(gy0) - 2
+    ix1, iy1 = int(gx1) + 3, int(gy1) + 3
+    patch = np.zeros((iy1 - iy0, ix1 - ix0), dtype=np.float32)
+    r0, r1 = iy0 // TILE_PX + 1, (iy1 - 1) // TILE_PX + 1
+    c0, c1 = ix0 // TILE_PX + 1, (ix1 - 1) // TILE_PX + 1
+    for r in range(r0, r1 + 1):
+        for c in range(c0, c1 + 1):
+            tx0, ty0 = (c - 1) * TILE_PX, (r - 1) * TILE_PX
+            sx0, sx1 = max(ix0, tx0), min(ix1, tx0 + TILE_PX)
+            sy0, sy1 = max(iy0, ty0), min(iy1, ty0 + TILE_PX)
+            if sx0 >= sx1 or sy0 >= sy1:
+                continue
+            arr = _get_tile(epoch, r, c, cache_dir, session, _tile_cache)
+            sub = np.asarray(arr[sy0 - ty0:sy1 - ty0,
+                                 sx0 - tx0:sx1 - tx0]).astype(np.float32)
+            sub[sub == NODATA] = 0.0
+            patch[sy0 - iy0:sy1 - iy0, sx0 - ix0:sx1 - ix0] = sub
+    im = Image.fromarray(patch, mode="F")
+    win = im.transform((GRID, GRID), Image.QUAD,
+                       (gx0 - ix0, gy0 - iy0, gx0 - ix0, gy1 - iy0,
+                        gx1 - ix0, gy1 - iy0, gx1 - ix0, gy0 - iy0),
+                       resample=Image.BILINEAR)
+    dens = np.asarray(win, dtype=np.float32) / cell_area_m2(lat)
     return np.clip(dens, 0.0, 1.0)
 
 
@@ -170,38 +201,76 @@ def make_sample_v2(elev, roads, d0, d1):
     return cond, target
 
 
-def build_dataset_v2(towns, out_path, cache_dir="ghsl_cache", verbose=True):
+def build_dataset_v2(towns, out_path, cache_dir="ghsl_cache", verbose=True,
+                     workers=3, town_cache_dir="data/town_cache_v2"):
     """Build the v2 dataset: for each town, one sample per consecutive epoch
-    pair with observed growth, plus rotation/flip augmentation."""
+    pair with observed growth, plus rotation/flip augmentation.
+
+    Towns are (name, country, lat, lon, region) tuples as in towns.py.
+    Resumable via per-town caches in `town_cache_dir`; parallel across a
+    small thread pool (Overpass capped at 2 concurrent, GHSL tile downloads
+    deduplicated by per-tile locks)."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     import requests
-    session = requests.Session()
+
+    os.makedirs(town_cache_dir, exist_ok=True)
     tile_cache = {}
-    conds, targets, names = [], [], []
-    for name, lat, lon in towns:
-        try:
-            elev = fetch_elevation(lat, lon, session)
-            roads, _ = rasterize_osm(fetch_osm(lat, lon, session), lat, lon)
-            dens = {ep: sample_density(lat, lon, ep, cache_dir, session,
-                                       tile_cache) for ep in EPOCHS}
-        except Exception as err:  # noqa: BLE001 - skip towns that fail
-            if verbose:
-                print(f"  skip {name}: {err}")
-            continue
-        n_pairs = 0
+    overpass_sem = threading.Semaphore(2)
+
+    def worker(town):
+        name, cc, lat, lon, _region = town
+        safe = f"{name}_{cc}".replace(" ", "_").replace("/", "_")
+        cache = os.path.join(town_cache_dir, safe + ".npz")
+        if os.path.exists(cache):
+            d = np.load(cache, allow_pickle=True)
+            return list(zip(d["cond"], d["target"])), list(d["pair"]), True
+        session = requests.Session()
+        elev = fetch_elevation(lat, lon, session)
+        with overpass_sem:
+            osm = fetch_osm(lat, lon, session, sleep=0.3)
+        roads, _ = rasterize_osm(osm, lat, lon)
+        dens = {ep: sample_density(lat, lon, ep, cache_dir, session,
+                                   tile_cache) for ep in EPOCHS}
+        raw, pairs = [], []
         for e0, e1 in zip(EPOCHS[:-1], EPOCHS[1:]):
             sample = make_sample_v2(elev, roads, dens[e0], dens[e1])
-            if sample is None:
+            if sample is not None:
+                raw.append(sample)
+                pairs.append(f"{name}_{e0}_{e1}")
+        np.savez_compressed(
+            cache,
+            cond=np.stack([c for c, _ in raw]) if raw
+            else np.zeros((0, 4, GRID, GRID), np.float32),
+            target=np.stack([t for _, t in raw]) if raw
+            else np.zeros((0, 2, GRID, GRID), np.float32),
+            pair=np.array(pairs))
+        return raw, pairs, False
+
+    conds, targets, names = [], [], []
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(worker, t): t for t in towns}
+        for fut in as_completed(futures):
+            town_name = futures[fut][0]
+            done += 1
+            try:
+                raw, pairs, cached = fut.result()
+            except Exception as err:  # noqa: BLE001 - skip towns that fail
+                if verbose:
+                    print(f"  {done}/{len(towns)} skip {town_name}: {err}")
                 continue
-            cond, target = sample
-            for k in range(4):
-                for flip in (False, True):
-                    c_a, t_a = augment(cond, target, k, flip)
-                    conds.append(c_a)
-                    targets.append(t_a)
-                    names.append(f"{name}_{e0}_{e1}")
-            n_pairs += 1
-        if verbose:
-            print(f"  {name}: {n_pairs} epoch pairs")
+            for (cond, target), pair in zip(raw, pairs):
+                for k in range(4):
+                    for flip in (False, True):
+                        c_a, t_a = augment(cond, target, k, flip)
+                        conds.append(c_a)
+                        targets.append(t_a)
+                        names.append(pair)
+            if verbose:
+                tag = "cached" if cached else "fetched"
+                print(f"  {done}/{len(towns)} {town_name} ({tag}): "
+                      f"{len(pairs)} epoch pairs")
     if not conds:
         raise RuntimeError("no v2 samples built")
     np.savez_compressed(out_path, cond=np.stack(conds),
@@ -212,5 +281,5 @@ def build_dataset_v2(towns, out_path, cache_dir="ghsl_cache", verbose=True):
 
 
 if __name__ == "__main__":
-    from towns import TRAIN_TOWNS
-    build_dataset_v2(TRAIN_TOWNS, "dataset_v2.npz")
+    from towns import TOWNS
+    build_dataset_v2(TOWNS, "data/dataset_v2.npz")
