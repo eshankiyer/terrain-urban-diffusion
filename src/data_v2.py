@@ -216,7 +216,7 @@ def build_dataset_v2(towns, out_path, cache_dir="ghsl_cache", verbose=True,
 
     os.makedirs(town_cache_dir, exist_ok=True)
     tile_cache = {}
-    overpass_sem = threading.Semaphore(2)
+    overpass_sem = threading.Semaphore(1)  # strictly serialise Overpass
 
     def worker(town):
         name, cc, lat, lon, _region = town
@@ -228,7 +228,7 @@ def build_dataset_v2(towns, out_path, cache_dir="ghsl_cache", verbose=True,
         session = requests.Session()
         elev = fetch_elevation(lat, lon, session)
         with overpass_sem:
-            osm = fetch_osm(lat, lon, session, sleep=0.3)
+            osm = fetch_osm(lat, lon, session, sleep=1.2)
         roads, _ = rasterize_osm(osm, lat, lon)
         dens = {ep: sample_density(lat, lon, ep, cache_dir, session,
                                    tile_cache) for ep in EPOCHS}

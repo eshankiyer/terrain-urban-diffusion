@@ -61,19 +61,25 @@ def _overpass_query(lat, lon, filters):
     return "[out:json][timeout:90];(" + "".join(parts) + ");out geom;"
 
 
-def _fetch(lat, lon, filters, session=None, sleep=1.0):
+def _fetch(lat, lon, filters, session=None, sleep=1.0, rounds=4):
     import requests
     session = session or requests.Session()
     q = _overpass_query(lat, lon, filters)
     last = None
-    for url in OVERPASS_URLS:
-        try:
-            r = session.post(url, data={"data": q}, timeout=120)
-            r.raise_for_status()
-            time.sleep(sleep)
-            return r.json()
-        except Exception as err:  # noqa: BLE001
-            last = err
+    for attempt in range(rounds):
+        for url in OVERPASS_URLS:
+            try:
+                r = session.post(url, data={"data": q}, timeout=120)
+                if r.status_code == 429:
+                    last = f"429 rate-limited by {url}"
+                    continue
+                r.raise_for_status()
+                time.sleep(sleep)
+                return r.json()
+            except Exception as err:  # noqa: BLE001
+                last = err
+        if attempt + 1 < rounds:
+            time.sleep(15.0 * (attempt + 1))
     raise RuntimeError(f"Overpass failed for {lat},{lon}: {last}")
 
 

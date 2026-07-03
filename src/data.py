@@ -34,6 +34,8 @@ TILE_Z = 13          # terrain tile zoom (~19 m/px at equator, resampled)
 OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
 TERRAIN_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
 
@@ -136,9 +138,10 @@ out geom;
 """
 
 
-def fetch_osm(lat, lon, session=None, sleep=1.0, rounds=2):
-    """Query Overpass with mirror rotation and a second retry round, so a
-    transient timeout doesn't silently drop a town from the dataset."""
+def fetch_osm(lat, lon, session=None, sleep=1.0, rounds=4):
+    """Query Overpass with mirror rotation, escalating backoff, and explicit
+    429 handling (rate limits are the norm from shared Colab egress IPs), so
+    a busy hour doesn't silently drop towns from the dataset."""
     import requests
     session = session or requests.Session()
     s, w, n, e = window_bbox(lat, lon)
@@ -148,13 +151,16 @@ def fetch_osm(lat, lon, session=None, sleep=1.0, rounds=2):
         for url in OVERPASS_URLS:
             try:
                 r = session.post(url, data={"data": q}, timeout=120)
+                if r.status_code == 429:
+                    last_err = f"429 rate-limited by {url}"
+                    continue  # try the next mirror, back off between rounds
                 r.raise_for_status()
                 time.sleep(sleep)  # be polite to the public API
                 return r.json()
             except Exception as err:  # noqa: BLE001 - retry on any failure
                 last_err = err
         if attempt + 1 < rounds:
-            time.sleep(8.0)  # back off before the retry round
+            time.sleep(15.0 * (attempt + 1))  # 15s, 30s, 45s between rounds
     raise RuntimeError(f"Overpass failed for {lat},{lon}: {last_err}")
 
 
@@ -268,7 +274,7 @@ def _town_windows(town, jitter, sess, overpass_sem=None):
             osm = fetch_osm(la, lo, sess)
         else:
             with overpass_sem:
-                osm = fetch_osm(la, lo, sess, sleep=0.3)
+                osm = fetch_osm(la, lo, sess, sleep=1.2)
         roads, built = rasterize_osm(osm, la, lo)
         s = make_sample(elev, roads, built)
         if s is not None:
@@ -290,7 +296,9 @@ def build_dataset(towns, out_path, jitter=3, verbose=True, workers=4,
     import requests
 
     os.makedirs(cache_dir, exist_ok=True)
-    overpass_sem = threading.Semaphore(2)
+    # ONE Overpass request at a time: terrain/GHSL still parallelise across
+    # workers, but the rate-limited API is strictly serialised.
+    overpass_sem = threading.Semaphore(1)
     n_cond = 4  # conditioning channels per sample
 
     def worker(town):
