@@ -111,6 +111,59 @@ control are both FiLM scalars with classifier-free-guidance dropout, so they
 share one retrain. Do all training-free capabilities first, prove the
 interaction loop, then pay for that one retrain.
 
+## v3 direction: the transit layer
+
+v2 generates urban fabric and audits walkability; transit is currently only
+a destination category in the 15-minute metric (bus stops and stations count
+as amenities, but no transit infrastructure is ever generated). A v3 would
+add that layer, and it decomposes into three different kinds of problem.
+
+Surface bus lanes and tram alignments are edge labeling on the road graph,
+the same shape as the bike-lane stage: train on well-tagged European cities
+(OSM busway, lanes:bus, railway=tram/light_rail) with corridor width, edge
+betweenness, and density-along-edge as features, then annotate generated
+arterials. Dedicated right-of-way and route planning is optimization, not
+generation: choose the corridor that maximizes residents within a 400 m
+walk of stops under a length budget, solved on the extracted graph and
+scored with a new transit-corridor term in the scorecard. Subways are the
+outlier: underground, decoupled from the surface raster, and only
+meaningful at city scale.
+
+That last point is the real commitment. Trams and metros exist in mid-size
+cities, not 5k-60k mountain towns, so v3 means a new city-scale dataset:
+larger windows (512 px or more), a city selection with usable transit
+tagging, and correspondingly more compute. The staging that keeps it
+tractable: bus-lane edge labeling first (works at current scale on
+arterial-rich towns), then the corridor optimizer, then the city-scale
+dataset jump only when the first two prove out.
+
+## v3 direction: typed zoning
+
+The model currently generates one undifferentiated density field; a planner
+needs to know WHERE residential, commercial, industrial and institutional
+uses go. Labels exist (OSM landuse polygons: residential, retail,
+commercial, industrial, plus amenity clusters for institutional), but they
+are patchy outside Europe and heavily imbalanced toward residential, so the
+staging mirrors the bike-lane decision. First a post-hoc stage (zones.py):
+classify generated density pixels into use classes from features the model
+already produces, such as distance to centre, arterial adjacency, slope,
+local density, and neighbouring existing uses, trained only where OSM
+labels exist. Then, at city scale, fold zoning into the diffusion output
+as K one-hot channels with a masked cross-entropy loss over labeled pixels.
+
+Typed zones unlock the scorecard metrics that make 15-minute claims real:
+land-use mix entropy within each walk-shed, a jobs-housing balance proxy
+(commercial+industrial area vs residential area reachable in 15 minutes),
+and hard compatibility penalties (new residential adjacent to industrial
+scores zero on a new nuisance metric). They also unlock the most
+interesting generative upgrade: an amenity-placement channel. v2 scores
+access against EXISTING amenities only, which correctly penalizes remote
+growth but cannot express "grow here AND put a school there." Letting the
+model emit a proposed-local-centre channel (trained on OSM amenity density)
+turns 15-minute planning fully generative, with the scorecard reporting
+access both with and without the proposed amenities so the assumption
+stays visible.
+
 ## Honest scope
 
 This remains a scenario-generation and critique tool. Land ownership, zoning
