@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terrain-Urban Diffusion — grow a town from your plan</title>
+<style>
+  :root { --ink:#1e2430; --paper:#f7f4ee; --accent:#d05f4e; --soft:#e8e2d6; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: Georgia, 'Times New Roman', serif;
+         background:var(--paper); color:var(--ink); line-height:1.55; }
+  header { padding:48px 20px 28px; text-align:center; }
+  header h1 { font-size:2rem; margin:0 0 10px; }
+  header p { max-width:680px; margin:0 auto; color:#4a5160; }
+  .links a { color:var(--accent); margin:0 10px; }
+  main { max-width:980px; margin:0 auto; padding:0 20px 80px; }
+  h2 { border-bottom:2px solid var(--soft); padding-bottom:6px; margin-top:44px; }
+  .tool { display:flex; flex-wrap:wrap; gap:24px; margin-top:18px; }
+  .panel { flex:1 1 380px; }
+  canvas { width:100%; max-width:440px; image-rendering:pixelated;
+           border:2px solid var(--ink); border-radius:4px; background:#fff;
+           touch-action:none; display:block; }
+  .toolbar { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0; }
+  button, label.filebtn { font-family:inherit; font-size:0.9rem; padding:7px 14px;
+           border:1.5px solid var(--ink); background:#fff; border-radius:4px;
+           cursor:pointer; }
+  button.active { background:var(--ink); color:#fff; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff;
+                   font-size:1rem; padding:10px 22px; }
+  button:disabled { opacity:0.45; cursor:default; }
+  input[type=file] { display:none; }
+  .legend { font-size:0.85rem; color:#4a5160; }
+  .legend span { display:inline-block; width:11px; height:11px; border-radius:2px;
+                 margin:0 4px 0 12px; vertical-align:baseline; }
+  #status { font-size:0.9rem; min-height:1.4em; color:#4a5160; margin-top:8px; }
+  .warn { background:#fdf0e4; border:1px solid #e8c9a8; border-radius:6px;
+          padding:10px 14px; font-size:0.9rem; }
+  figure { margin:24px 0; }
+  figure img { width:100%; border:1px solid var(--soft); border-radius:4px; }
+  figcaption { font-size:0.85rem; color:#4a5160; margin-top:6px; }
+  .steps { color:#4a5160; }
+  footer { text-align:center; color:#8a8fa0; font-size:0.85rem; padding:28px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Terrain-Urban Diffusion</h1>
+  <p>A diffusion model that grows small towns on real terrain. It is trained
+  on forty years of observed settlement change (GHSL 1980&ndash;2020), and a
+  15-minute-city scorecard ranks what it generates. Draw a plan below, or
+  drop in a screenshot of any city grid, and the model continues it.</p>
+  <p class="links">
+    <a href="https://github.com/eshankiyer/terrain-urban-diffusion">code</a> ·
+    <a href="https://github.com/eshankiyer/terrain-urban-diffusion/tree/v3">v3 branch</a> ·
+    <a href="https://github.com/eshankiyer/terrain-urban-diffusion/blob/v2/ROADMAP.md">roadmap</a>
+  </p>
+</header>
+<main>
+
+<h2>Try it: sketch or screenshot → grown town</h2>
+<p class="steps">Black lines are roads, warm colours are buildings, green is
+kept free. Upload works with map screenshots too — dark thin features read
+as roads, warm blocks as buildings. Terrain is procedural here; the
+research pipeline uses real elevation.</p>
+
+<div class="tool">
+  <div class="panel">
+    <canvas id="draw" width="128" height="128"></canvas>
+    <div class="toolbar">
+      <button id="t-road" class="active">road ✏️</button>
+      <button id="t-built">buildings 🟥</button>
+      <button id="t-park">park 🟩</button>
+      <button id="t-erase">erase</button>
+      <button id="t-clear">clear</button>
+      <label class="filebtn">upload screenshot<input id="file" type="file" accept="image/*"></label>
+    </div>
+    <button id="go" class="primary">Grow this town →</button>
+    <div id="status"></div>
+  </div>
+  <div class="panel">
+    <canvas id="out" width="128" height="128"></canvas>
+    <div class="legend">
+      <span style="background:#8a8a8a"></span>your plan
+      <span style="background:#f2b660"></span>generated growth
+      <span style="background:#222"></span>roads
+      <span style="background:#d62828"></span>★ proposed local centres
+    </div>
+    <div id="modelnote"></div>
+  </div>
+</div>
+
+<h2>What you are looking at</h2>
+<p>The model is a compact conditional U-Net (~13M parameters) that denoises
+a growth plan given four conditioning rasters: elevation, slope, the
+existing built footprint, and the existing road network. Version 3 emits
+three channels — new roads, new built density, and a proposed
+amenity-density field. Alongside housing, it suggests where a bakery,
+school or clinic would let the new streets work as a 15-minute
+neighbourhood. In the full pipeline, sixteen futures are sampled per site
+and an 11-metric scorecard (walk coverage, green preservation, flood and
+landslide avoidance, congestion, access equity) keeps the most
+sustainable ones.</p>
+
+<h2>Example output</h2>
+<figure>
+  <img src="assets/sustainable_topk.png" alt="Top-3 ranked futures for a held-out town">
+  <figcaption>Top-3 sustainability-ranked futures for a held-out town
+  (v2 model): generated density, per-pixel 15-minute walk-time maps, and
+  bike-lane annotations from the slope-aware edge classifier.</figcaption>
+</figure>
+
+<footer>Research preview · outputs are plausible morphology, not engineering
+or planning advice · MIT-style, see repo</footer>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.min.js"></script>
+<script>
+"use strict";
+const G = 128, T_STEPS = 1000, OUT_CH = 3, STEPS = 24;
+const dc = document.getElementById("draw"), dx = dc.getContext("2d");
+const oc = document.getElementById("out"), ox = oc.getContext("2d");
+const statusEl = document.getElementById("status");
+dx.fillStyle = "#ffffff"; dx.fillRect(0, 0, G, G);
+ox.fillStyle = "#ffffff"; ox.fillRect(0, 0, G, G);
+
+/* ---------- drawing ---------- */
+const tools = { road: {c:"#141414", r:0.7}, built: {c:"#c85a3c", r:3},
+                park: {c:"#78b46e", r:3}, erase: {c:"#ffffff", r:4} };
+let tool = "road", drawing = false, last = null;
+for (const id of ["road","built","park","erase"]) {
+  document.getElementById("t-"+id).onclick = (e) => {
+    tool = id;
+    document.querySelectorAll(".toolbar button").forEach(b=>b.classList.remove("active"));
+    e.target.classList.add("active");
+  };
+}
+document.getElementById("t-clear").onclick = () => {
+  dx.fillStyle="#fff"; dx.fillRect(0,0,G,G);
+};
+function pos(e) {
+  const r = dc.getBoundingClientRect();
+  const p = e.touches ? e.touches[0] : e;
+  return [(p.clientX-r.left)/r.width*G, (p.clientY-r.top)/r.height*G];
+}
+function stroke(a, b) {
+  const t = tools[tool];
+  dx.strokeStyle = t.c; dx.fillStyle = t.c;
+  dx.lineWidth = t.r*2; dx.lineCap = "round";
+  dx.beginPath(); dx.moveTo(a[0],a[1]); dx.lineTo(b[0],b[1]); dx.stroke();
+}
+for (const [ev, fn] of [["pointerdown", e=>{drawing=true; last=pos(e); stroke(last,last);}],
+                        ["pointermove", e=>{if(!drawing)return; const p=pos(e); stroke(last,p); last=p;}],
+                        ["pointerup",   ()=>drawing=false],
+                        ["pointerleave",()=>drawing=false]])
+  dc.addEventListener(ev, fn);
+
+document.getElementById("file").onchange = (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  const img = new Image();
+  img.onload = () => { dx.fillStyle="#fff"; dx.fillRect(0,0,G,G);
+                       dx.drawImage(img, 0, 0, G, G); };
+  img.src = URL.createObjectURL(f);
+};
+
+/* ---------- parsing (mirrors plan_import.py) ---------- */
+function parsePlan() {
+  const d = dx.getImageData(0,0,G,G).data;
+  const roads = new Uint8Array(G*G), built = new Uint8Array(G*G);
+  for (let i = 0; i < G*G; i++) {
+    const r = d[4*i], g = d[4*i+1], b = d[4*i+2];
+    const lum = (r*299 + g*587 + b*114) / 1000;
+    const sat = Math.max(r,g,b) - Math.min(r,g,b);
+    if (lum < 70) roads[i] = 1;
+    else if (sat > 60 && r > g && r >= b) built[i] = 1;
+  }
+  return { roads, built };
+}
+
+/* ---------- terrain + conditioning (mirrors cond_from_plan) ---------- */
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+let gaussSpare = null;
+function gauss(rng){ if(gaussSpare!==null){const s=gaussSpare;gaussSpare=null;return s;}
+  let u=0,v=0; while(u===0)u=rng(); while(v===0)v=rng();
+  const m=Math.sqrt(-2*Math.log(u)), s=m*Math.sin(2*Math.PI*v);
+  gaussSpare=m*Math.cos(2*Math.PI*v); return s; }
+function heightmap(seed, relief=300) {
+  const rng = mulberry32(seed), acc = new Float64Array(G*G);
+  for (let o = 0, size = 4; o < 5; o++, size *= 2) {
+    const grid = [];
+    for (let i = 0; i < (size+1)*(size+1); i++) grid.push(rng()*2-1);
+    const amp = Math.pow(0.5, o);
+    for (let y = 0; y < G; y++) for (let x = 0; x < G; x++) {
+      const fy = y/(G-1)*size, fx = x/(G-1)*size;
+      const y0 = Math.floor(fy), x0 = Math.floor(fx);
+      const ty = fy-y0, tx = fx-x0, w = size+1;
+      const v = grid[y0*w+x0]*(1-ty)*(1-tx) + grid[Math.min(y0+1,size)*w+x0]*ty*(1-tx)
+              + grid[y0*w+Math.min(x0+1,size)]*(1-ty)*tx
+              + grid[Math.min(y0+1,size)*w+Math.min(x0+1,size)]*ty*tx;
+      acc[y*G+x] += amp*v;
+    }
+  }
+  let mn=1e9, mx=-1e9;
+  for (const v of acc){ mn=Math.min(mn,v); mx=Math.max(mx,v); }
+  const out = new Float64Array(G*G);
+  for (let i=0;i<G*G;i++) out[i]=(acc[i]-mn)/(mx-mn)*relief;
+  return out;
+}
+function condFrom(roads, built, elev) {
+  const n = G*G, M = 15.0;
+  let mean=0; for(let i=0;i<n;i++) mean+=elev[i]; mean/=n;
+  let sd=0; for(let i=0;i<n;i++) sd+=(elev[i]-mean)**2; sd=Math.sqrt(sd/n)+1e-6;
+  const slope = new Float64Array(n);
+  const at=(y,x)=>elev[Math.max(0,Math.min(G-1,y))*G+Math.max(0,Math.min(G-1,x))];
+  for (let y=0;y<G;y++) for (let x=0;x<G;x++) {
+    const gx=(at(y,x+1)-at(y,x-1))/(2*M), gy=(at(y+1,x)-at(y-1,x))/(2*M);
+    slope[y*G+x]=Math.atan(Math.hypot(gx,gy))*180/Math.PI;
+  }
+  const dens = new Float32Array(n);
+  for (let i=0;i<n;i++) dens[i]=built[i]*0.5;
+  const foot = new Uint8Array(n);           // dilate(dens>0.03, r=2)
+  for (let y=0;y<G;y++) for (let x=0;x<G;x++) {
+    let hit=0;
+    for (let dy=-2;dy<=2&&!hit;dy++) for (let dx2=-2;dx2<=2;dx2++) {
+      if (dy*dy+dx2*dx2>4) continue;
+      const yy=y+dy, xx=x+dx2;
+      if (yy>=0&&yy<G&&xx>=0&&xx<G&&dens[yy*G+xx]>0.03){hit=1;break;}
+    }
+    foot[y*G+x]=hit;
+  }
+  const cond = new Float32Array(4*n);
+  for (let i=0;i<n;i++) {
+    cond[i]       = Math.max(-3,Math.min(3,(elev[i]-mean)/sd))/3;
+    cond[n+i]     = Math.min(1, Math.max(0, slope[i]/30));
+    cond[2*n+i]   = dens[i];
+    cond[3*n+i]   = roads[i]*foot[i];
+  }
+  return cond;
+}
+
+/* ---------- DDIM sampling with onnxruntime-web ---------- */
+function alphasBar() {
+  const f = [], s = 0.008;
+  for (let i = 0; i <= T_STEPS; i++)
+    f.push(Math.cos((i/T_STEPS + s)/(1+s)*Math.PI/2)**2);
+  const ab = new Float64Array(T_STEPS);
+  let cum = 1;
+  for (let i = 0; i < T_STEPS; i++) {
+    const beta = Math.min(0.999, Math.max(1e-8, 1 - f[i+1]/f[i]));
+    cum *= (1-beta); ab[i]=cum;
+  }
+  return ab;
+}
+let session = null, modelMissing = false;
+async function getSession() {
+  if (session || modelMissing) return session;
+  try {
+    statusEl.textContent = "loading model weights (~50 MB, first time only)…";
+    session = await ort.InferenceSession.create("model/model.onnx",
+      { executionProviders: ["wasm"] });
+  } catch (e) {
+    modelMissing = true;
+    document.getElementById("modelnote").innerHTML =
+      '<div class="warn">Model weights are not published on this site yet ' +
+      '(v3 training in progress). Your plan parses fine — the same drawing ' +
+      'convention works in the <a href="https://colab.research.google.com/' +
+      'github/eshankiyer/terrain-urban-diffusion/blob/v3/notebooks/' +
+      'v3_zoned_towns_colab.ipynb">Colab notebook</a>, cell 6.</div>';
+  }
+  return session;
+}
+async function generate() {
+  const btn = document.getElementById("go");
+  btn.disabled = true;
+  try {
+    const {roads, built} = parsePlan();
+    const elev = heightmap(7);
+    const cond = condFrom(roads, built, elev);
+    renderOut(elev, roads, built, null, null);      // show parsed plan now
+    const sess = await getSession();
+    if (!sess) { statusEl.textContent = "showing parsed plan only (no weights)"; return; }
+    const n = G*G, ab = alphasBar();
+    const rng = mulberry32(1234); gaussSpare = null;
+    let x = new Float32Array(OUT_CH*n);
+    for (let i=0;i<x.length;i++) x[i]=gauss(rng);
+    const condT = new ort.Tensor("float32", cond, [1,4,G,G]);
+    const ts = [];
+    for (let i=0;i<STEPS;i++) ts.push(Math.round((T_STEPS-1)*(1-i/(STEPS-1))));
+    for (let i=0;i<STEPS;i++) {
+      statusEl.textContent = `denoising… step ${i+1}/${STEPS}`;
+      await new Promise(r=>setTimeout(r));
+      const t = ts[i], abT = ab[t];
+      const abP = (i+1<STEPS) ? ab[ts[i+1]] : 1.0;
+      const feeds = { x: new ort.Tensor("float32", x, [1,OUT_CH,G,G]),
+                      cond: condT,
+                      t: new ort.Tensor("int64", BigInt64Array.from([BigInt(t)]), [1]) };
+      const eps = (await sess.run(feeds)).eps.data;
+      const nx = new Float32Array(OUT_CH*n);
+      const sA=Math.sqrt(abT), sB=Math.sqrt(1-abT), sAp=Math.sqrt(abP), sBp=Math.sqrt(1-abP);
+      for (let j=0;j<nx.length;j++) {
+        const x0 = Math.max(-1, Math.min(1, (x[j]-sB*eps[j])/sA));
+        nx[j] = sAp*x0 + sBp*eps[j];
+      }
+      x = nx;
+    }
+    const newRoads = new Uint8Array(n), newDens = new Float32Array(n), amen = new Float32Array(n);
+    for (let i=0;i<n;i++) {
+      newRoads[i] = x[i] > 0 ? 1 : 0;
+      newDens[i]  = Math.max(0, Math.min(1, (x[n+i]+1)/2));
+      amen[i]     = Math.max(0, Math.min(1, (x[2*n+i]+1)/2));
+    }
+    renderOut(elev, roads, built, {newRoads, newDens}, amen);
+    statusEl.textContent = "done — grey is your plan, orange is the model's growth";
+  } catch (err) {
+    statusEl.textContent = "error: " + err.message;
+  } finally { btn.disabled = false; }
+}
+document.getElementById("go").onclick = generate;
+
+/* ---------- output rendering ---------- */
+function renderOut(elev, roads, built, gen, amen) {
+  const img = ox.createImageData(G, G), n = G*G;
+  const at=(y,x)=>elev[Math.max(0,Math.min(G-1,y))*G+Math.max(0,Math.min(G-1,x))];
+  for (let y=0;y<G;y++) for (let x=0;x<G;x++) {
+    const i=y*G+x;
+    const gx=(at(y,x+1)-at(y,x-1))/30, gy=(at(y+1,x)-at(y-1,x))/30;
+    const sl=Math.atan(Math.hypot(gx,gy)), asp=Math.atan2(-gx,gy);
+    const sh=(Math.sin(0.785)*Math.cos(sl)+Math.cos(0.785)*Math.sin(sl)*Math.cos(5.5-asp)+1)/2;
+    let r=200+sh*45, g=198+sh*45, b=188+sh*45;
+    if (gen && gen.newDens[i] > 0.12 && !built[i]) { r=242; g=182; b=96; }
+    if (built[i]) { r=g=b=120; }
+    if (roads[i] || (gen && gen.newRoads[i])) { r=g=b=32; }
+    img.data[4*i]=r; img.data[4*i+1]=g; img.data[4*i+2]=b; img.data[4*i+3]=255;
+  }
+  ox.putImageData(img, 0, 0);
+  if (amen) {                                  // top proposed centres
+    const a = Float32Array.from(amen);
+    ox.fillStyle = "#d62828"; ox.strokeStyle="#fff"; ox.lineWidth=0.4;
+    for (let k=0;k<4;k++) {
+      let bi=0; for (let i=1;i<a.length;i++) if (a[i]>a[bi]) bi=i;
+      if (a[bi] < 0.3) break;
+      const y=Math.floor(bi/G), x=bi%G;
+      ox.beginPath();
+      for (let p=0;p<10;p++) {
+        const ang=-Math.PI/2+p*Math.PI/5, rad=p%2?1.6:3.6;
+        ox[p?'lineTo':'moveTo'](x+rad*Math.cos(ang), y+rad*Math.sin(ang));
+      }
+      ox.closePath(); ox.fill(); ox.stroke();
+      for (let yy=Math.max(0,y-12);yy<Math.min(G,y+12);yy++)
+        for (let xx=Math.max(0,x-12);xx<Math.min(G,x+12);xx++) a[yy*G+xx]=0;
+    }
+  }
+}
+
+/* seed the canvas with the demo sketch so the page isn't blank */
+(function demo(){
+  dx.strokeStyle="#141414"; dx.lineWidth=1.6; dx.lineCap="round";
+  dx.beginPath(); dx.moveTo(10,70); dx.lineTo(118,62); dx.stroke();
+  dx.beginPath(); dx.moveTo(64,20); dx.lineTo(60,108); dx.stroke();
+  dx.fillStyle="#c85a3c";
+  for (const [cx,cy] of [[50,60],[72,58],[58,76],[70,74]])
+    dx.fillRect(cx-6, cy-5, 12, 10);
+  dx.fillStyle="#78b46e"; dx.fillRect(84,40,20,16);
+})();
+</script>
+</body>
+</html>
