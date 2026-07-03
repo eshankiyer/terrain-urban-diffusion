@@ -1,0 +1,420 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage[numbers]{natbib}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+
+\title{Terrain-Conditioned Diffusion for Generating Street-Level
+Expansion Layouts of Small Towns}
+
+\author{Eshan Iyer\\
+\small Independent researcher\\
+\small \texttt{Code: \url{https://github.com/eshankiyer/terrain-urban-diffusion}}}
+
+\date{July 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Generative models for urban layouts have concentrated on large,
+grid-dominated cities, typically in the United States, and almost
+universally ignore the terrain the city sits on. Yet for the small towns
+that make up most settlements worldwide---and especially for towns in
+hilly regions of Europe and Asia---topography is a first-order constraint
+on where streets and buildings can go. We present a conditional denoising
+diffusion model that generates street-level expansion layouts (road
+rasters and built-up area) for small towns, conditioned jointly on
+terrain (elevation and slope) and the existing settlement footprint. The
+model is trained on windows around approximately sixty towns in hilly
+terrain across Europe and Asia, assembled automatically from
+OpenStreetMap vectors and open elevation tiles, using a concentric-erosion
+proxy to recover core/expansion training pairs from present-day
+footprints. A single trained model supports two inference modes: a
+\emph{real mode}, which proposes expansions for actual towns, and a
+\emph{sandbox mode}, in which the model is applied iteratively to an
+arbitrary heightmap so that a settlement grows step by step, in the manner
+of a city-building game. On held-out towns, generated expansions track the
+slope-occupancy statistics of real growth substantially better than a
+slope-blind baseline while maintaining road connectivity to the existing
+network. We release code, the town list, and the training pipeline.
+\textcolor{red}{[RESULTS-PLACEHOLDER: final numbers inserted from
+evaluation run.]}
+\end{abstract}
+
+\section{Introduction}
+
+Most generative work on urban form asks the question: what does a city
+look like? This paper asks a narrower and, we argue, more practically
+useful question: given a particular small town, on particular terrain,
+what would its next increment of growth plausibly look like?
+
+The distinction matters for three reasons. First, most of the world's
+settlements are not large cities. Small towns dominate by count, and their
+growth decisions---where a new residential street goes, which hillside
+gets terraced---are made with far less planning capacity than a
+metropolitan government has. A tool that proposes terrain-respecting
+expansion options is more useful at this scale, not less. Second, terrain
+is the binding constraint precisely where planning capacity is lowest:
+the hill towns of Nepal, the Italian Apennines, or the Western Ghats
+cannot borrow street patterns from Chicago. Third, existing generative
+models have a documented geographic bias: the most capable urban layout
+generators are trained on large, mostly American cities
+\citep{he2025stepwise, xie2023citygen, he2023globalmapper}, whose gridded
+morphology transfers poorly to organically grown towns; where non-US
+cities have been included, the models have measurably struggled with
+non-grid street orientation \citep{jiang2025dcgan}.
+
+Terrain-aware settlement growth modelling is not itself new. The SLEUTH
+family of cellular automata has used slope as a growth driver since the
+1990s \citep{clarke1998sleuth}, and modern deep-learning land-use-change
+models routinely include elevation among their covariates
+\citep{chughtai2024casurvey}. But these models predict growth
+\emph{probability} at coarse resolution: their output is a per-pixel
+likelihood of urbanisation, not a design. They cannot say where the
+street goes. Conversely, recent diffusion-based layout generators produce
+street-level designs but condition on land use, text, or nothing at all
+--- not on topography \citep{he2025stepwise, espinosa2023scotland,
+wang2025satellite}. Diffusion models that do engage with terrain generate
+the terrain itself \citep{borne2025mesa, hu2023tdn}, not settlements upon
+it. The specific combination this paper addresses---street-level
+generative layout design, conditioned on terrain, for small towns, trained
+on European and Asian data---is, to our knowledge, unoccupied.
+
+Our contributions are:
+\begin{enumerate}
+\item A fully automatic data pipeline that assembles terrain-conditioned
+expansion training pairs for arbitrary towns from OpenStreetMap and open
+elevation tiles, requiring no manual annotation and no API keys, together
+with a curated list of $\sim$60 training and 8 held-out small towns in
+hilly terrain across Europe and Asia.
+\item A concentric-erosion proxy that recovers (core, expansion-ring)
+supervision pairs from a single present-day snapshot, sidestepping the
+scarcity of historical street-level data for small towns; we state its
+assumptions and failure modes explicitly.
+\item A compact ($\sim$13M parameter) conditional diffusion model that
+generates joint road/built-up expansion rasters, and an evaluation
+protocol measuring slope compliance, road connectivity, and built-up
+contiguity against a slope-blind baseline on held-out towns.
+\item A demonstration that one trained model supports both proposal
+generation for real towns and iterative, game-like growth of synthetic
+settlements on arbitrary heightmaps, which we discuss as the
+decision-making layer of a prospective automated city-building agent.
+\end{enumerate}
+
+\section{Related Work}
+
+\subsection{Generative urban layout models}
+Procedural methods based on shape grammars and production rules have long
+been used to synthesise street networks \citep{parish2001procedural,
+beirao2010grammar}, and remain the standard in game tooling; their
+weakness is the manual rule-crafting required per style. Learning-based
+approaches replaced rules with data: Neural Turtle Graphics models road
+layouts autoregressively \citep{chu2019ntg}, GlobalMapper generates
+building layouts for arbitrary blocks with graph attention
+\citep{he2023globalmapper}, and CityGen \citep{xie2023citygen} and
+CityDreamer \citep{xie2025citydreamer} produce unbounded city layouts
+with diffusion. Closest to our setting, He et al.\ propose a stepwise
+multimodal-diffusion urban design framework trained on Chicago and New
+York \citep{he2025stepwise}, and explicitly note the restriction to
+US-grid morphology as a limitation. GAN-based urban form models trained
+on multiple cities report degraded fidelity on non-grid cities
+\citep{jiang2025dcgan}. None of these condition on terrain.
+
+\subsection{Urban growth and land-use-change models}
+SLEUTH \citep{clarke1998sleuth} takes slope, land use, exclusions, urban
+extent, transport and hillshade as inputs to a cellular automaton and
+remains widely applied \citep{nigeria2024sleuth}; extensions couple CA
+with support vector machines \citep{rienow2015svm} or deep networks
+\citep{chughtai2024casurvey}. Deep sequence models (ConvLSTM) forecast
+urban growth from satellite time series \citep{boulila2024convlstm}.
+These models incorporate terrain but output coarse urbanisation
+probabilities rather than street-level layouts; they simulate
+\emph{whether} a cell urbanises, not \emph{what is built}.
+
+\subsection{Terrain and geospatial generation}
+Diffusion models generate realistic terrain from text or sketches
+\citep{borne2025mesa, hu2023tdn, terrafusion2025}, and
+map-or-primitive-conditioned diffusion synthesises satellite imagery
+\citep{espinosa2023scotland, wei2026terradit}. GPS coordinates have been
+used as conditioning for image generation \citep{feng2025gps}. This line
+of work treats terrain as the \emph{output} or the imagery as the target;
+we invert the relationship, treating terrain as a constraint under which
+settlement structure must be generated.
+
+\subsection{Generative models as game agents}
+Automating construction in city-building games has mostly meant
+procedural map generation. Playing such a game requires perception,
+decision-making, and actuation layers. We position our model as the
+decision-making layer---current city state and heightmap in, next
+construction increment out---and discuss integration via game modding
+APIs in Section~\ref{sec:applications}.
+
+\section{Method}
+
+\subsection{Problem formulation}
+Let $E \in \mathbb{R}^{H \times W}$ be an elevation raster over a
+window of $\sim$1.9\,km ($H{=}W{=}128$ at 15\,m/px), $S$ its slope, and
+$(R_c, B_c)$ binary rasters of the \emph{core} road network and built-up
+area. The model learns the conditional distribution
+$p(R_r, B_r \mid E, S, R_c, B_c)$ over \emph{ring} (expansion) roads and
+built-up area. Conditioning channels are concatenated: elevation is
+z-scored per window and clipped to $\pm 3\sigma$; slope is normalised by
+$30^\circ$. Targets are mapped to $\{-1, 1\}$.
+
+\subsection{Growth supervision by concentric erosion}
+\label{sec:erosion}
+Historical street-level data for small towns is scarce and inconsistent
+across countries. We instead construct supervision from present-day
+snapshots: the observed built-up mask $B$ is eroded with a disc of radius
+$\rho = 10$\,px ($\approx$150\,m) to produce a pseudo-historical core
+$B_c$, and the ring $B_r = B \setminus B_c$ becomes the generation
+target; ring roads are defined analogously. The proxy assumes
+predominantly outward, concentric growth. This assumption is reasonable
+for compact hill towns, whose steep surroundings suppress leapfrog
+development, but it is wrong for linear valley towns that grow along a
+single axis and for towns whose growth is dominated by infill. We keep
+the proxy because it makes the pipeline fully automatic, and we flag the
+resulting bias in Section~\ref{sec:limitations}. Nothing in the
+architecture depends on it: given true temporal pairs (e.g.\ from
+historical cadastral data or multi-epoch built-up products), the same
+model trains unchanged.
+
+\subsection{Architecture and training}
+A U-Net with three resolution levels (64/128/256 channels), residual
+blocks, sinusoidal timestep embeddings, and self-attention at the two
+coarsest resolutions predicts the added noise $\epsilon$ under a cosine
+noise schedule with $T{=}1000$ steps \citep{ho2020ddpm,
+nichol2021improved}. The 4 conditioning channels are concatenated to the
+2 noisy target channels at the input ($\sim$13M parameters). We train
+with AdamW, cosine learning-rate decay, gradient clipping at 1.0, and an
+EMA of the weights (decay 0.999); sampling uses 50 DDIM steps
+\citep{song2021ddim}. Each town window is augmented by the dihedral
+group (8 orientations) and small centre jitter.
+
+\subsection{Two inference modes}
+\textbf{Real mode.} For a real town, the pipeline fetches current
+elevation and OSM rasters, erodes to a core exactly as in training, and
+samples an expansion conditioned on the true terrain.
+\textbf{Sandbox mode.} For an arbitrary heightmap (fractal noise here; a
+game-exported heightmap in principle), a seed settlement of a few pixels
+is placed on low-slope ground and the model is applied iteratively: the
+union of the previous state and the generated ring becomes the next
+core. Each round is one ``turn'' of automated play.
+
+\section{Experiments}
+
+\subsection{Data}
+$\sim$60 training towns and 8 held-out towns (population roughly
+5k--60k) in hilly regions of Europe (Alps, Apennines, Iberia, Balkans)
+and Asia (Japan, the Indian Himalaya and Western Ghats, Nepal, Vietnam,
+Indonesia, Turkey, the Caucasus), listed in the repository. Windows with
+insufficient settlement are dropped automatically.
+\textcolor{red}{[RESULTS-PLACEHOLDER: final sample counts.]}
+
+\subsection{Metrics and baseline}
+On each held-out town we compare the generated ring to the real ring:
+\textbf{Slope KS} --- Kolmogorov--Smirnov distance between the slope
+distributions under generated vs.\ real ring built-up pixels (lower is
+better; measures whether the model builds on the kinds of slopes the
+town actually built on);
+\textbf{Road connectivity} --- fraction of generated road pixels
+8-connected to the core network;
+\textbf{Built contiguity} --- fraction of generated ring pixels adjacent
+to at least two settlement pixels;
+\textbf{Volume ratio} --- generated/real ring area.
+The baseline scatters the same built area uniformly at random over the
+window (slope-blind), a deliberately weak control that isolates whether
+the model uses terrain at all.
+
+\subsection{Results}
+\textcolor{red}{[RESULTS-PLACEHOLDER: table of metrics, model vs
+baseline, overall and split by Europe/Asia; loss curve; qualitative
+figures for real-mode case studies; sandbox growth sequence figure;
+discussion of what the numbers show, written after the numbers exist.]}
+
+\section{Applications: towards automated city-building agents}
+\label{sec:applications}
+The sandbox mode is a decision-making layer for game automation: at each
+turn it maps (heightmap, current city) to a construction increment. A
+complete agent for a title such as Cities: Skylines~2 additionally needs
+perception (reading the game's heightmap and current road/zone state,
+available through its modding API) and actuation (executing placements,
+also exposed to mods). Because our model consumes and produces rasters,
+the integration surface is thin. We do not implement it here; we note
+that raster-to-game-geometry conversion (vectorising road rasters into
+placeable splines) is the main engineering step.
+
+\section{Limitations}
+\label{sec:limitations}
+The concentric-erosion proxy biases training toward ring-like growth
+(Section~\ref{sec:erosion}); multi-epoch built-up products such as GHSL
+would provide true temporal supervision at coarser spatial detail. OSM
+completeness varies across Asia, under-representing buildings in some
+towns; our built-up masks partially compensate with land-use polygons.
+Rasters at 15\,m/px cannot represent parcel-level structure. The
+evaluation baseline is deliberately weak; comparison against SLEUTH-class
+CA models and layout generators retrofitted with terrain channels is
+future work. Generated layouts are proposals, not plans: no zoning law,
+hydrology, hazard, or land-ownership information enters the model.
+\textcolor{red}{[RESULTS-PLACEHOLDER: any additional limitations
+observed in the actual training run.]}
+
+\section{Conclusion}
+We presented a terrain-conditioned diffusion model for street-level
+expansion of small towns, trained on European and Asian data assembled
+fully automatically, evaluated on held-out towns, and usable both as a
+proposal tool for real settlements and as an iterative growth engine on
+arbitrary heightmaps.
+
+\section*{AI assistance disclosure}
+The code, experiments, and text of this paper were produced with
+substantial assistance from an AI system (Anthropic Claude), directed
+and reviewed by the author. This disclosure is made in accordance with
+venue policies on AI-assisted research.
+
+\bibliographystyle{unsrtnat}
+\begin{thebibliography}{99}
+
+\bibitem[Clarke and Gaydos(1998)]{clarke1998sleuth}
+K.~C. Clarke and L.~J. Gaydos.
+\newblock Loose-coupling a cellular automaton model and GIS: long-term urban
+growth prediction for San Francisco and Washington/Baltimore.
+\newblock \emph{International Journal of Geographical Information Science},
+12(7):699--714, 1998.
+
+\bibitem[He et~al.(2025)]{he2025stepwise}
+M.~He, Y.~Liang, S.~Wang, Y.~Zheng, Q.~Wang, D.~Zhuang, L.~Tian, and J.~Zhao.
+\newblock Generative AI for urban design: A stepwise approach integrating
+human expertise with multimodal diffusion models.
+\newblock \emph{arXiv preprint arXiv:2505.24260}, 2025.
+
+\bibitem[Xie et~al.(2023)]{xie2023citygen}
+Z.~Xie et~al.
+\newblock CityGen: Infinite and controllable city layout generation.
+\newblock \emph{arXiv preprint arXiv:2312.01508}, 2023.
+
+\bibitem[He and Aliaga(2023)]{he2023globalmapper}
+L.~He and D.~Aliaga.
+\newblock GlobalMapper: Arbitrary-shaped urban layout generation.
+\newblock In \emph{ICCV}, 2023.
+
+\bibitem[Jiang et~al.(2025)]{jiang2025dcgan}
+F.~Jiang et~al.
+\newblock A generative urban form design framework based on deep
+convolutional GANs and landscape pattern metrics for sustainable renewal in
+highly urbanized cities.
+\newblock \emph{Sustainability}, 17(10):4548, 2025.
+
+\bibitem[Chughtai et~al.(2024)]{chughtai2024casurvey}
+A.~H. Chughtai et~al.
+\newblock Integrating cellular automata with deep learning for urban growth
+modelling: a review.
+\newblock 2024.
+
+\bibitem[Espinosa and Crowley(2023)]{espinosa2023scotland}
+M.~Espinosa and E.~J. Crowley.
+\newblock Generate your own Scotland: Satellite image generation conditioned
+on maps.
+\newblock \emph{arXiv preprint arXiv:2308.16648}, 2023.
+
+\bibitem[Wang et~al.(2025)]{wang2025satellite}
+Q.~Wang et~al.
+\newblock Generative AI for urban planning: Synthesizing satellite imagery
+via diffusion models.
+\newblock \emph{arXiv preprint arXiv:2505.08833}, 2025.
+
+\bibitem[Borne-Pons et~al.(2025)]{borne2025mesa}
+P.~Borne-Pons, M.~Czerkawski, R.~Martin, and R.~Rouffet.
+\newblock MESA: Text-driven terrain generation using latent diffusion and
+global Copernicus data.
+\newblock \emph{arXiv preprint arXiv:2504.07210}, 2025.
+
+\bibitem[Hu et~al.(2023)]{hu2023tdn}
+Z.~Hu, K.~Hu, C.~Mo, L.~Pan, and Z.~Wang.
+\newblock Terrain diffusion network: Climatic-aware terrain generation with
+geological sketch guidance.
+\newblock \emph{arXiv preprint arXiv:2308.16725}, 2023.
+
+\bibitem[Parish and M{\"u}ller(2001)]{parish2001procedural}
+Y.~I.~H. Parish and P.~M{\"u}ller.
+\newblock Procedural modeling of cities.
+\newblock In \emph{SIGGRAPH}, 2001.
+
+\bibitem[Beir{\~a}o et~al.(2010)]{beirao2010grammar}
+J.~Beir{\~a}o, J.~Duarte, and R.~Stouffs.
+\newblock Implementing a generative urban design model: Grammar-based design
+patterns for urban design.
+\newblock In \emph{eCAADe}, 2010.
+
+\bibitem[Chu et~al.(2019)]{chu2019ntg}
+H.~Chu et~al.
+\newblock Neural turtle graphics for modeling city road layouts.
+\newblock In \emph{ICCV}, 2019.
+
+\bibitem[Xie et~al.(2025)]{xie2025citydreamer}
+H.~Xie, Z.~Chen, F.~Hong, and Z.~Liu.
+\newblock CityDreamer4D: Compositional generative model of unbounded 4D
+cities.
+\newblock \emph{arXiv preprint arXiv:2501.08983}, 2025.
+
+\bibitem[Agyemang et~al.(2024)]{nigeria2024sleuth}
+F.~S.~K. Agyemang et~al.
+\newblock Assessing the suitability of the SLEUTH cellular automata model for
+capturing heterogeneous urban growth in developing cities.
+\newblock \emph{PLOS ONE}, 2024.
+
+\bibitem[Rienow and Goetzke(2015)]{rienow2015svm}
+A.~Rienow and R.~Goetzke.
+\newblock Supporting SLEUTH -- enhancing a cellular automaton with support
+vector machines for urban growth modeling.
+\newblock \emph{Computers, Environment and Urban Systems}, 49:66--81, 2015.
+
+\bibitem[Boulila et~al.(2024)]{boulila2024convlstm}
+W.~Boulila et~al.
+\newblock A comparative analysis on the use of a cellular automata Markov
+chain versus a convolutional LSTM model in forecasting urban growth using
+Sentinel 2A images.
+\newblock \emph{Journal of Land Use Science}, 2024.
+
+\bibitem[Ho et~al.(2020)]{ho2020ddpm}
+J.~Ho, A.~Jain, and P.~Abbeel.
+\newblock Denoising diffusion probabilistic models.
+\newblock In \emph{NeurIPS}, 2020.
+
+\bibitem[Nichol and Dhariwal(2021)]{nichol2021improved}
+A.~Nichol and P.~Dhariwal.
+\newblock Improved denoising diffusion probabilistic models.
+\newblock In \emph{ICML}, 2021.
+
+\bibitem[Song et~al.(2021)]{song2021ddim}
+J.~Song, C.~Meng, and S.~Ermon.
+\newblock Denoising diffusion implicit models.
+\newblock In \emph{ICLR}, 2021.
+
+\bibitem[Wei et~al.(2026)]{wei2026terradit}
+B.~Wei, S.~Sastry, D.~Cher, E.~Xing, and N.~Jacobs.
+\newblock TerraDiT-$\Omega$: Unified spatial control for satellite image
+synthesis with any geospatial primitive.
+\newblock \emph{arXiv preprint arXiv:2606.31029}, 2026.
+
+\bibitem[Feng et~al.(2025)]{feng2025gps}
+C.~Feng, Z.~Chen, A.~Holynski, A.~A. Efros, and A.~Owens.
+\newblock GPS as a control signal for image generation.
+\newblock \emph{arXiv preprint arXiv:2501.12390}, 2025.
+
+\bibitem[TerraFusion(2025)]{terrafusion2025}
+K.~Sasaki et~al.
+\newblock TerraFusion: Joint generation of terrain geometry and texture
+using latent diffusion models.
+\newblock \emph{arXiv preprint arXiv:2505.04050}, 2025.
+
+\end{thebibliography}
+
+\end{document}
