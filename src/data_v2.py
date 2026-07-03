@@ -132,7 +132,9 @@ def _get_tile(epoch, r, c, cache_dir, session, _tile_cache):
     if _tile_cache is not None and key in _tile_cache:
         return _tile_cache[key]
     arr = load_tile(epoch, r, c, cache_dir, session)
-    if _tile_cache is not None:
+    # Only cache lazy zarr views. When _open_tile falls back to a full read,
+    # the array is ~288 MB; caching dozens of those OOM-kills a Colab VM.
+    if _tile_cache is not None and not isinstance(arr, np.ndarray):
         _tile_cache[key] = arr
     return arr
 
