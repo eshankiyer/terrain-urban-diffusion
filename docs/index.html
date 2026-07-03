@@ -3,7 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Terrain-Urban Diffusion — grow a town from your plan</title>
+<title>Terrain-Urban Diffusion: grow a town from your plan</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  #map { height: 420px; border:2px solid var(--ink); border-radius:4px; }
+</style>
 <style>
   :root { --ink:#1e2430; --paper:#f7f4ee; --accent:#d05f4e; --soft:#e8e2d6; }
   * { box-sizing: border-box; }
@@ -59,7 +63,7 @@
 
 <h2>Try it: sketch or screenshot → grown town</h2>
 <p class="steps">Black lines are roads, warm colours are buildings, green is
-kept free. Upload works with map screenshots too — dark thin features read
+kept free. Upload works with map screenshots too: dark thin features read
 as roads, warm blocks as buildings. Terrain is procedural here; the
 research pipeline uses real elevation.</p>
 
@@ -89,11 +93,24 @@ research pipeline uses real elevation.</p>
   </div>
 </div>
 
+<h2>Real-town mode: grow a real place on the map</h2>
+<p class="steps">Click anywhere on the map to drop a 1.9 km study window.
+The site fetches real elevation (AWS terrain tiles) and real roads and
+buildings (OpenStreetMap) for that spot, runs the model, and drapes the
+generated growth over the map. Small towns in hilly Europe or Asia match
+the training data best; megacities will confuse it.</p>
+<div id="map"></div>
+<div class="toolbar" style="margin-top:10px">
+  <button id="grow-real" class="primary" disabled>Grow this place →</button>
+  <button id="clear-real">clear overlay</button>
+</div>
+<div id="status-real" class="legend" style="min-height:1.4em"></div>
+
 <h2>What you are looking at</h2>
 <p>The model is a compact conditional U-Net (~13M parameters) that denoises
 a growth plan given four conditioning rasters: elevation, slope, the
 existing built footprint, and the existing road network. Version 3 emits
-three channels — new roads, new built density, and a proposed
+three channels: new roads, new built density, and a proposed
 amenity-density field. Alongside housing, it suggests where a bakery,
 school or clinic would let the new streets work as a 15-minute
 neighbourhood. In the full pipeline, sixteen futures are sampled per site
@@ -114,6 +131,7 @@ or planning advice · MIT-style, see repo</footer>
 </main>
 
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.min.js"></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 "use strict";
 const G = 128, T_STEPS = 1000, OUT_CH = 3, STEPS = 24;
@@ -250,6 +268,34 @@ function alphasBar() {
   }
   return ab;
 }
+async function runDDIM(sess, cond, statusNode) {
+  const n = G*G, ab = alphasBar();
+  const rng = mulberry32(1234); gaussSpare = null;
+  let x = new Float32Array(OUT_CH*n);
+  for (let i=0;i<x.length;i++) x[i]=gauss(rng);
+  const condT = new ort.Tensor("float32", cond, [1,4,G,G]);
+  const ts = [];
+  for (let i=0;i<STEPS;i++) ts.push(Math.round((T_STEPS-1)*(1-i/(STEPS-1))));
+  for (let i=0;i<STEPS;i++) {
+    statusNode.textContent = `denoising, step ${i+1}/${STEPS}`;
+    await new Promise(r=>setTimeout(r));
+    const t = ts[i], abT = ab[t];
+    const abP = (i+1<STEPS) ? ab[ts[i+1]] : 1.0;
+    const feeds = { x: new ort.Tensor("float32", x, [1,OUT_CH,G,G]),
+                    cond: condT,
+                    t: new ort.Tensor("int64", BigInt64Array.from([BigInt(t)]), [1]) };
+    const eps = (await sess.run(feeds)).eps.data;
+    const nx = new Float32Array(OUT_CH*n);
+    const sA=Math.sqrt(abT), sB=Math.sqrt(1-abT), sAp=Math.sqrt(abP), sBp=Math.sqrt(1-abP);
+    for (let j=0;j<nx.length;j++) {
+      const x0 = Math.max(-1, Math.min(1, (x[j]-sB*eps[j])/sA));
+      nx[j] = sAp*x0 + sBp*eps[j];
+    }
+    x = nx;
+  }
+  return x;
+}
+
 let session = null, modelMissing = false;
 async function getSession() {
   if (session || modelMissing) return session;
@@ -261,7 +307,7 @@ async function getSession() {
     modelMissing = true;
     document.getElementById("modelnote").innerHTML =
       '<div class="warn">Model weights are not published on this site yet ' +
-      '(v3 training in progress). Your plan parses fine — the same drawing ' +
+      '(v3 training in progress). Your plan parses fine, and the same drawing ' +
       'convention works in the <a href="https://colab.research.google.com/' +
       'github/eshankiyer/terrain-urban-diffusion/blob/v3/notebooks/' +
       'v3_zoned_towns_colab.ipynb">Colab notebook</a>, cell 6.</div>';
@@ -278,30 +324,8 @@ async function generate() {
     renderOut(elev, roads, built, null, null);      // show parsed plan now
     const sess = await getSession();
     if (!sess) { statusEl.textContent = "showing parsed plan only (no weights)"; return; }
-    const n = G*G, ab = alphasBar();
-    const rng = mulberry32(1234); gaussSpare = null;
-    let x = new Float32Array(OUT_CH*n);
-    for (let i=0;i<x.length;i++) x[i]=gauss(rng);
-    const condT = new ort.Tensor("float32", cond, [1,4,G,G]);
-    const ts = [];
-    for (let i=0;i<STEPS;i++) ts.push(Math.round((T_STEPS-1)*(1-i/(STEPS-1))));
-    for (let i=0;i<STEPS;i++) {
-      statusEl.textContent = `denoising… step ${i+1}/${STEPS}`;
-      await new Promise(r=>setTimeout(r));
-      const t = ts[i], abT = ab[t];
-      const abP = (i+1<STEPS) ? ab[ts[i+1]] : 1.0;
-      const feeds = { x: new ort.Tensor("float32", x, [1,OUT_CH,G,G]),
-                      cond: condT,
-                      t: new ort.Tensor("int64", BigInt64Array.from([BigInt(t)]), [1]) };
-      const eps = (await sess.run(feeds)).eps.data;
-      const nx = new Float32Array(OUT_CH*n);
-      const sA=Math.sqrt(abT), sB=Math.sqrt(1-abT), sAp=Math.sqrt(abP), sBp=Math.sqrt(1-abP);
-      for (let j=0;j<nx.length;j++) {
-        const x0 = Math.max(-1, Math.min(1, (x[j]-sB*eps[j])/sA));
-        nx[j] = sAp*x0 + sBp*eps[j];
-      }
-      x = nx;
-    }
+    const x = await runDDIM(sess, cond, statusEl);
+    const n = G*G;
     const newRoads = new Uint8Array(n), newDens = new Float32Array(n), amen = new Float32Array(n);
     for (let i=0;i<n;i++) {
       newRoads[i] = x[i] > 0 ? 1 : 0;
@@ -309,7 +333,7 @@ async function generate() {
       amen[i]     = Math.max(0, Math.min(1, (x[2*n+i]+1)/2));
     }
     renderOut(elev, roads, built, {newRoads, newDens}, amen);
-    statusEl.textContent = "done — grey is your plan, orange is the model's growth";
+    statusEl.textContent = "done. grey is your plan, orange is the model's growth";
   } catch (err) {
     statusEl.textContent = "error: " + err.message;
   } finally { btn.disabled = false; }
@@ -350,6 +374,143 @@ function renderOut(elev, roads, built, gen, amen) {
     }
   }
 }
+
+/* ---------- real-town mode: click the map, grow that place ---------- */
+const HALF_M = G * 15 / 2;
+const map = L.map("map").setView([46.0, 10.0], 5);
+L.tileLayer("https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png",
+  { attribution: "&copy; OpenStreetMap contributors &copy; CARTO",
+    maxZoom: 18 }).addTo(map);
+const statusReal = document.getElementById("status-real");
+const growBtn = document.getElementById("grow-real");
+let pick = null, pickRect = null, overlays = [];
+
+function windowBounds(lat, lon) {
+  const dLat = HALF_M / 111320;
+  const dLon = HALF_M / (111320 * Math.cos(lat * Math.PI / 180));
+  return [[lat - dLat, lon - dLon], [lat + dLat, lon + dLon]];
+}
+map.on("click", (e) => {
+  pick = e.latlng;
+  if (pickRect) map.removeLayer(pickRect);
+  pickRect = L.rectangle(windowBounds(pick.lat, pick.lng),
+    { color: "#d05f4e", weight: 2, fill: false }).addTo(map);
+  growBtn.disabled = false;
+  statusReal.textContent = `window set at ${pick.lat.toFixed(4)}, ${pick.lng.toFixed(4)}`;
+});
+document.getElementById("clear-real").onclick = () => {
+  overlays.forEach(o => map.removeLayer(o)); overlays = [];
+  statusReal.textContent = "";
+};
+
+async function fetchElevReal(lat, lon) {
+  const z = 13, n2 = 2 ** z;
+  const b = windowBounds(lat, lon);
+  const [s, w] = b[0], [nn, e] = b[1];
+  const tx = (lo) => (lo + 180) / 360 * n2;
+  const ty = (la) => (1 - Math.asinh(Math.tan(la * Math.PI / 180)) / Math.PI) / 2 * n2;
+  const x0 = Math.floor(tx(w)), x1 = Math.floor(tx(e));
+  const y0 = Math.floor(ty(nn)), y1 = Math.floor(ty(s));
+  const cnv = document.createElement("canvas");
+  cnv.width = (x1 - x0 + 1) * 256; cnv.height = (y1 - y0 + 1) * 256;
+  const ctx = cnv.getContext("2d");
+  const jobs = [];
+  for (let X = x0; X <= x1; X++) for (let Y = y0; Y <= y1; Y++)
+    jobs.push(new Promise((res, rej) => {
+      const im = new Image(); im.crossOrigin = "anonymous";
+      im.onload = () => { ctx.drawImage(im, (X - x0) * 256, (Y - y0) * 256); res(); };
+      im.onerror = rej;
+      im.src = `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${X}/${Y}.png`;
+    }));
+  await Promise.all(jobs);
+  const img = ctx.getImageData(0, 0, cnv.width, cnv.height).data;
+  const elev = new Float64Array(G * G);
+  for (let py = 0; py < G; py++) for (let px = 0; px < G; px++) {
+    const la = nn - (py + 0.5) / G * (nn - s);
+    const lo = w + (px + 0.5) / G * (e - w);
+    const fx = Math.min(cnv.width - 1, Math.max(0, (tx(lo) - x0) * 256));
+    const fy = Math.min(cnv.height - 1, Math.max(0, (ty(la) - y0) * 256));
+    const i = 4 * (Math.round(fy) * cnv.width + Math.round(fx));
+    elev[py * G + px] = img[i] * 256 + img[i + 1] + img[i + 2] / 256 - 32768;
+  }
+  return elev;
+}
+
+async function fetchOSMReal(lat, lon) {
+  const b = windowBounds(lat, lon);
+  const q = `[out:json][timeout:60];(way(${b[0][0]},${b[0][1]},${b[1][0]},${b[1][1]})` +
+    `["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|unclassified|living_street|service)"];` +
+    `way(${b[0][0]},${b[0][1]},${b[1][0]},${b[1][1]})["building"];);out geom;`;
+  const r = await fetch("https://overpass-api.de/api/interpreter",
+    { method: "POST", body: "data=" + encodeURIComponent(q) });
+  const js = await r.json();
+  const cnv = document.createElement("canvas"); cnv.width = G; cnv.height = G;
+  const ctx = cnv.getContext("2d");
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, G, G);
+  const [s, w] = b[0], [nn, e] = b[1];
+  const toPx = (g) => [ (g.lon - w) / (e - w) * (G - 1),
+                        (nn - g.lat) / (nn - s) * (G - 1) ];
+  for (const el of js.elements || []) {
+    if (el.type !== "way" || !el.geometry) continue;
+    const pts = el.geometry.map(toPx);
+    ctx.beginPath();
+    pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+    if (el.tags && el.tags.building) { ctx.closePath(); ctx.fillStyle = "#c85a3c"; ctx.fill(); }
+    else { ctx.strokeStyle = "#141414"; ctx.lineWidth = 1.2; ctx.stroke(); }
+  }
+  const d = ctx.getImageData(0, 0, G, G).data;
+  const roads = new Uint8Array(G * G), built = new Uint8Array(G * G);
+  for (let i = 0; i < G * G; i++) {
+    const r0 = d[4*i], g0 = d[4*i+1], b0 = d[4*i+2];
+    const lum = (r0*299 + g0*587 + b0*114) / 1000;
+    if (lum < 70) roads[i] = 1;
+    else if (r0 > g0 && Math.max(r0,g0,b0)-Math.min(r0,g0,b0) > 60) built[i] = 1;
+  }
+  return { roads, built };
+}
+
+growBtn.onclick = async () => {
+  if (!pick) return;
+  growBtn.disabled = true;
+  try {
+    statusReal.textContent = "fetching elevation and OSM data";
+    const [elev, osm] = await Promise.all([
+      fetchElevReal(pick.lat, pick.lng), fetchOSMReal(pick.lat, pick.lng)]);
+    const cond = condFrom(osm.roads, osm.built, elev);
+    const sess = await getSession();
+    const bounds = windowBounds(pick.lat, pick.lng);
+    const cnv = document.createElement("canvas"); cnv.width = G; cnv.height = G;
+    const ctx = cnv.getContext("2d");
+    const im = ctx.createImageData(G, G);
+    const paint = (i, r, g, b, a) => { im.data[4*i]=r; im.data[4*i+1]=g;
+                                       im.data[4*i+2]=b; im.data[4*i+3]=a; };
+    if (!sess) {
+      for (let i = 0; i < G*G; i++) {
+        if (osm.roads[i]) paint(i, 20, 20, 20, 210);
+        else if (osm.built[i]) paint(i, 120, 120, 120, 170);
+      }
+      statusReal.textContent = "no model weights yet: overlay shows the parsed existing town";
+    } else {
+      const x = await runDDIM(sess, cond, statusReal);
+      const n = G*G;
+      for (let i = 0; i < n; i++) {
+        const newRoad = x[i] > 0 && !osm.roads[i];
+        const dNew = Math.max(0, Math.min(1, (x[n+i]+1)/2));
+        if (osm.roads[i]) paint(i, 20, 20, 20, 190);
+        else if (newRoad) paint(i, 208, 95, 78, 230);
+        else if (dNew > 0.12 && !osm.built[i]) paint(i, 242, 182, 96, 190);
+        else if (osm.built[i]) paint(i, 120, 120, 120, 150);
+      }
+      statusReal.textContent = "done. orange is generated growth, red-brown is new roads";
+    }
+    ctx.putImageData(im, 0, 0);
+    const ov = L.imageOverlay(cnv.toDataURL(), bounds, { opacity: 0.85 }).addTo(map);
+    overlays.push(ov);
+    map.fitBounds(bounds);
+  } catch (err) {
+    statusReal.textContent = "error: " + err.message;
+  } finally { growBtn.disabled = false; }
+};
 
 /* seed the canvas with the demo sketch so the page isn't blank */
 (function demo(){
