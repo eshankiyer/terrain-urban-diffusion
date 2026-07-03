@@ -155,7 +155,8 @@ def circuity(roads, n_pairs=60, seed=0):
         ratios.append(min(net_px / eu, 4.0) if np.isfinite(net_px) else 4.0)
         if len(ratios) >= 20:
             break
-    return float(np.mean(ratios)) if ratios else 4.0
+    # a network too compact to contain a >=15 px pair is local, not circuitous
+    return float(np.mean(ratios)) if ratios else 1.0
 
 
 def earthwork_index(new_roads, elev):
@@ -198,15 +199,240 @@ def scorecard(roads_all, density_new, d0, elev, n_centers=3):
     return total, sub
 
 
-def rank_samples(candidates, d0, elev, n_centers=3):
+def rank_samples(candidates, d0, elev, n_centers=3, env=None, roads0=None):
     """Rank sampled futures by sustainability. `candidates` is a list of
     (roads_all, density_new) arrays. Returns indices best-first plus the
-    scores, so callers can show the top-k most 15-minute-compatible
-    futures instead of an arbitrary one."""
+    scores. If `env` (from environment.fetch_environment) is given, the
+    full 11-metric scorecard_v2 is used; otherwise the legacy scorecard.
+
+    Delivery adjustment: all avoidance metrics score 1.0 for a plan that
+    builds nothing, so the do-nothing sample would otherwise dominate
+    best-of-N. Ranking therefore multiplies the score by a factor of
+    0.5 + 0.5 * min(growth / median_growth, 1), which penalises samples
+    that deliver far less housing than their batch peers while leaving
+    the per-plan scorecard itself untouched."""
     scored = []
+    growths = []
     for i, (roads_all, dens) in enumerate(candidates):
-        total, sub = scorecard(roads_all, dens, d0, elev, n_centers)
+        if env is not None:
+            total, sub = scorecard_v2(roads_all, dens, d0, elev, env, roads0)
+            growths.append(sub.get("_growth_px", 0))
+        else:
+            total, sub = scorecard(roads_all, dens, d0, elev, n_centers)
         scored.append((total, i, sub))
-    scored.sort(reverse=True)
+    positive = [g for g in growths if g > 0]
+    if env is not None and positive:
+        med = float(np.median(positive))
+        if med > 0:
+            scored = [(t * (0.5 + 0.5 * min(s.get("_growth_px", 0) / med,
+                                            1.0)), i, s)
+                      for t, i, s in scored]
+    scored.sort(key=lambda t: (-t[0], t[1]))
     order = [i for _, i, _ in scored]
     return order, {i: (t, s) for t, i, s in scored}
+
+
+# ----------------------------------------------------------------------------
+# v2 scorecard: real amenities, greenspace, hazards, congestion, equity.
+# Metrics M1-M11 and weights follow the multi-perspective design spec.
+# ----------------------------------------------------------------------------
+
+WEIGHTS_V2 = {"amenity": 0.18, "infill": 0.10, "efficiency": 0.08,
+              "circuity": 0.06, "earthwork": 0.06, "green_preserve": 0.10,
+              "green_access": 0.08, "flood": 0.10, "landslide": 0.08,
+              "congestion": 0.08, "equity": 0.08}
+
+GREEN_ACCESS_MIN = 300.0 / WALK_SPEED_M_MIN   # 300 m walk ~ 3.75 min
+
+
+def _snap_points_to_roads(points, roads, max_r=8):
+    return _snap_to_roads(points, roads, max_r)
+
+
+def amenity_access(density, roads, amenities, walk_limit=WALK_LIMIT_MIN):
+    """Per-pixel served fraction over amenity categories PRESENT in the
+    window (categories absent from the whole window are excluded so small
+    towns are compared on what exists; documented deviation from a fixed
+    six-category denominator). A category that exists but cannot be reached
+    over the road network contributes ZERO coverage — it stays in the
+    denominator. Returns (served_fraction map, n_categories)."""
+    present = {c: p for c, p in amenities.items() if p}
+    if not present:
+        return np.zeros_like(density, dtype=np.float64), 0
+    served = np.zeros_like(density, dtype=np.float64)
+    for cat, pts in present.items():
+        snapped = _snap_points_to_roads(pts, roads)
+        if not snapped:
+            continue  # unreachable category: zero reach, still counted below
+        minutes = walk_time_map(roads.astype(bool), snapped)
+        reach = binary_dilate((minutes <= walk_limit).astype(np.uint8),
+                              ACCESS_BUFFER_PX)
+        served += reach.astype(np.float64)
+    return served / len(present), len(present)
+
+
+def new_development_masks(dens_future, d0, roads_all, roads0=None):
+    """(new_roads, new_dev) boolean masks. Pre-existing roads are NOT new
+    development: pass `roads0` (the baseline road raster) so mountain
+    switchbacks that predate the plan are excluded. Without `roads0` the
+    legacy footprint heuristic is used (documented, less accurate)."""
+    foot0 = binary_dilate((d0 > DENSITY_THR).astype(np.uint8), 2).astype(bool)
+    if roads0 is not None:
+        old_roads = binary_dilate(roads0.astype(np.uint8), 1).astype(bool)
+        new_roads = roads_all.astype(bool) & ~old_roads
+    else:
+        new_roads = roads_all.astype(bool) & ~foot0
+    new_dev = ((dens_future > DENSITY_THR) & ~foot0) | new_roads
+    return new_roads, new_dev
+
+
+def green_metrics(dens_future, d0, env, new_roads=None):
+    """(M6 preservation, M7 access). Preservation is measured against the
+    BASELINE functional green: new green elsewhere cannot buy back cleared
+    green, and NEW roads clear green just like buildings do. Access is a
+    300 m NETWORK walk (not straight-line) to a functional green patch."""
+    from environment import functional_green
+    g0 = env["green0_functional"].astype(bool)
+    cleared = dens_future > DENSITY_THR
+    if new_roads is not None:
+        cleared = cleared | new_roads
+    if g0.sum() == 0:
+        preserve = 1.0
+    else:
+        preserve = float((g0 & ~cleared).sum() / g0.sum())
+    remaining = functional_green((g0 & ~cleared).astype(np.uint8))
+    built = np.maximum(dens_future, d0) > DENSITY_THR
+    if built.sum() == 0 or remaining.sum() == 0:
+        return preserve, 0.0
+    # network walk: seed Dijkstra at road pixels adjacent to remaining green
+    roads = env.get("_roads_all")
+    if roads is None:
+        from scipy.ndimage import distance_transform_edt
+        dist_px = distance_transform_edt(~remaining.astype(bool))
+        served = dist_px <= (300.0 / M_PER_PX)
+    else:
+        near_green = binary_dilate(remaining, 1).astype(bool) & roads.astype(bool)
+        seeds = list(zip(*np.nonzero(near_green)))
+        if not seeds:
+            return preserve, 0.0
+        minutes = walk_time_map(roads.astype(bool), seeds)
+        served = binary_dilate((minutes <= GREEN_ACCESS_MIN).astype(np.uint8),
+                               ACCESS_BUFFER_PX).astype(bool)
+    access = float((built & served).sum() / built.sum())
+    return preserve, access
+
+
+def hazard_metrics(dens_future, d0, roads_all, env, roads0=None):
+    """(M8 flood avoidance, M9 landslide avoidance) over NEW development
+    only. Severe (>35 deg) landslide cells count double via the nested
+    masks: severe cells are already in slide_prone, so prone+severe = 2x."""
+    _, new_dev = new_development_masks(dens_future, d0, roads_all, roads0)
+    n = new_dev.sum()
+    if n == 0:
+        return 1.0, 1.0
+    flood = float(1.0 - (new_dev & env["flood"].astype(bool)).sum() / n)
+    prone = (new_dev & env["slide_prone"].astype(bool)).sum()
+    severe = (new_dev & env["slide_severe"].astype(bool)).sum()
+    landslide = float(1.0 - min((prone + severe) / n, 1.0))
+    return flood, landslide
+
+
+def _gini(values):
+    v = np.sort(np.asarray(values, dtype=np.float64))
+    if len(v) == 0 or v.sum() == 0:
+        return 0.0
+    n = len(v)
+    return float((2 * np.arange(1, n + 1) - n - 1).dot(v) / (n * v.sum()))
+
+
+def _cluster_endpoints(edges, radius=2):
+    """Skeleton junctions are clusters of adjacent pixels, so raw polyline
+    endpoints rarely coincide. Union endpoints within a Chebyshev radius so
+    edges meeting at the same junction share a graph node."""
+    pts = []
+    for e in edges:
+        pts.extend([e[0], e[-1]])
+    pts = list(dict.fromkeys(pts))
+    parent = list(range(len(pts)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            if (abs(pts[i][0] - pts[j][0]) <= radius
+                    and abs(pts[i][1] - pts[j][1]) <= radius):
+                parent[find(i)] = find(j)
+    return {p: find(i) for i, p in enumerate(pts)}
+
+
+def congestion_bottleneck(roads, seed=0):
+    """M10: 1 - Gini of edge betweenness on the road graph. Dendritic
+    single-spine networks concentrate load (high Gini, low score); redundant
+    grids spread it. Structural proxy, not a traffic forecast."""
+    import networkx as nx
+    from bikelanes import skeleton_to_edges
+    edges = skeleton_to_edges(roads)
+    if len(edges) < 4:
+        return 0.0
+    node_of = _cluster_endpoints(edges)
+    g = nx.Graph()
+    for pts in edges:
+        a, b = node_of[pts[0]], node_of[pts[-1]]
+        if a != b:
+            g.add_edge(a, b, weight=float(len(pts)))
+    if g.number_of_edges() < 3:
+        return 0.0
+    k = min(64, g.number_of_nodes())
+    bc = nx.edge_betweenness_centrality(g, k=k, weight="weight", seed=seed)
+    return float(max(0.0, 1.0 - max(0.0, _gini(list(bc.values())))))
+
+
+def access_equity(served_fraction, density):
+    """M11: 1 - population-weighted coefficient of variation of the served
+    fraction over residential cells. Spatial access equity ONLY; income,
+    tenure, affordability and displacement are human inputs, not scored."""
+    res = density > DENSITY_THR
+    w = density[res]
+    a = served_fraction[res]
+    if len(a) == 0 or w.sum() == 0:
+        return 0.0
+    mean = float(np.average(a, weights=w))
+    if mean <= 1e-9:
+        return 0.0
+    var = float(np.average((a - mean) ** 2, weights=w))
+    return float(max(0.0, 1.0 - math.sqrt(var) / mean))
+
+
+def scorecard_v2(roads_all, density_new, d0, elev, env, roads0=None):
+    """0-100 sustainability score with the 11-metric spec. `env` comes from
+    environment.fetch_environment (real amenities, green, water, hazards).
+    Pass `roads0` (baseline roads) so pre-existing roads are not scored as
+    new development in M5/M8/M9 and green metrics."""
+    dens_future = np.maximum(density_new, d0)
+    new_roads, new_dev = new_development_masks(dens_future, d0, roads_all,
+                                               roads0)
+
+    served, n_cats = amenity_access(dens_future, roads_all, env["amenities"])
+    res = dens_future > DENSITY_THR
+    m1 = float(served[res].mean()) if res.sum() and n_cats else 0.0
+    m2 = infill_share(d0, dens_future)
+    m3 = min(land_efficiency(d0, dens_future) / 0.3, 1.0)
+    m4 = max(0.0, 1.0 - (circuity(roads_all) - 1.0) / 1.5)
+    m5 = max(0.0, 1.0 - earthwork_index(new_roads.astype(np.uint8),
+                                        elev) / 20.0)
+    env = dict(env, _roads_all=roads_all)
+    m6, m7 = green_metrics(dens_future, d0, env, new_roads=new_roads)
+    m8, m9 = hazard_metrics(dens_future, d0, roads_all, env, roads0)
+    m10 = congestion_bottleneck(roads_all)
+    m11 = access_equity(served, dens_future)
+
+    sub = {"amenity": m1, "infill": m2, "efficiency": m3, "circuity": m4,
+           "earthwork": m5, "green_preserve": m6, "green_access": m7,
+           "flood": m8, "landslide": m9, "congestion": m10, "equity": m11}
+    total = 100.0 * sum(WEIGHTS_V2[k] * sub[k] for k in WEIGHTS_V2)
+    sub["_growth_px"] = int(new_dev.sum())
+    return total, sub

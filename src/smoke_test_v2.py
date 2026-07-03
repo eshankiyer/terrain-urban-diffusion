@@ -1,5 +1,7 @@
 """Offline smoke test for the v2 modules (no network, no GHSL download)."""
 
+import math
+
 import numpy as np
 
 import data_v2
@@ -102,9 +104,179 @@ def test_sustainability():
     print(f"sustainability ok (compact {total_c:.0f} > sprawl {total_s:.0f})")
 
 
+def _fake_env(elev, green=None, water=None, amenities=None):
+    import environment as env_mod
+    green = green if green is not None else np.zeros((GRID, GRID), np.uint8)
+    water = water if water is not None else np.zeros((GRID, GRID), np.uint8)
+    prone, severe = env_mod.landslide_masks(elev)
+    return {"amenities": amenities or {}, "green0": green,
+            "green0_functional": env_mod.functional_green(green),
+            "water": water, "flood": env_mod.flood_mask(elev, water),
+            "slide_prone": prone, "slide_severe": severe}
+
+
+def test_acceptance_v2():
+    """Acceptance tests T1-T8 from the design spec."""
+    import time as _time
+    import environment as env_mod
+    import sustainability as sus
+    flat = np.zeros((GRID, GRID), dtype=np.float32)
+
+    # T1: functional green patch threshold (19 px ignored, 21 px kept)
+    g = np.zeros((GRID, GRID), np.uint8)
+    g[10, 10:29] = 1                        # 19-px line
+    g[40:43, 40:47] = 1                     # 21-px block
+    fg = env_mod.functional_green(g)
+    assert fg[10, 10:29].sum() == 0 and fg[40:43, 40:47].sum() == 21
+
+    # T2: preservation penalty — building over half of baseline green
+    g2 = np.zeros((GRID, GRID), np.uint8)
+    g2[60:70, 20:60] = 1
+    envd = _fake_env(flat, green=g2)
+    dens_clear = np.zeros((GRID, GRID), np.float32)
+    dens_clear[60:70, 20:40] = 0.5          # builds over left half
+    p_half, _ = sus.green_metrics(dens_clear, np.zeros_like(dens_clear), envd)
+    p_all, _ = sus.green_metrics(np.zeros_like(dens_clear),
+                                 np.zeros_like(dens_clear), envd)
+    assert abs(p_half - 0.5) < 0.05 and p_all == 1.0
+
+    # T3: flood proxy — 3 m above stream within ~100 m flagged, 12 m not
+    xx = np.abs(np.arange(GRID) - 64).astype(np.float32)
+    elev_v = np.tile(xx, (GRID, 1))         # 1 m per px away from x=64
+    water = np.zeros((GRID, GRID), np.uint8)
+    water[:, 64] = 1
+    fm = env_mod.flood_mask(elev_v, water)
+    assert fm[50, 67] == 1 and fm[50, 76] == 0
+
+    # T4: landslide thresholds with doubled severe penalty. Each candidate
+    # is half on flat ground, half on a slope band, so scores don't saturate:
+    # flat -> 1.0, half-26deg -> 0.5, half-36deg -> 0.0 (2x severe penalty).
+    ramp = np.zeros((GRID, GRID), dtype=np.float32)
+    ramp[40:80] = np.arange(GRID) * 15.0 * math.tan(math.radians(26))
+    ramp[80:] = np.arange(GRID) * 15.0 * math.tan(math.radians(36))
+    env_r = _fake_env(ramp)
+    d0 = np.zeros((GRID, GRID), np.float32)
+    roads0 = np.zeros((GRID, GRID), np.uint8)
+
+    def dev_on(rows_hazard):
+        dev = d0.copy()
+        dev[5:20, 40:60] = 0.4                       # flat half (15 rows)
+        if rows_hazard:
+            dev[rows_hazard[0]:rows_hazard[1], 40:60] = 0.4  # hazard half
+        return dev
+
+    _, m9_flat = sus.hazard_metrics(dev_on(None), d0, roads0, env_r)
+    _, m9_26 = sus.hazard_metrics(dev_on((45, 60)), d0, roads0, env_r)
+    _, m9_36 = sus.hazard_metrics(dev_on((85, 100)), d0, roads0, env_r)
+    assert m9_flat == 1.0 and m9_36 < m9_26 < 1.0, (m9_flat, m9_26, m9_36)
+    assert abs(m9_26 - 0.5) < 0.1 and m9_36 < 0.1, (m9_26, m9_36)
+
+    # T5: amenity access uses REAL amenities only, no density-peak credit
+    roads = np.zeros((GRID, GRID), np.uint8)
+    roads[64, :] = 1
+    amen = {"food": [(64, 20)], "education": [(64, 24)], "health": [(64, 28)]}
+    env_a = _fake_env(flat, amenities=amen)
+    near = np.zeros((GRID, GRID), np.float32); near[60:68, 15:35] = 0.4
+    far = np.zeros((GRID, GRID), np.float32); far[60:68, 105:125] = 0.4
+    d00 = np.zeros((GRID, GRID), np.float32)
+    _, sub_near = sus.scorecard_v2(roads, near, d00, flat, env_a)
+    _, sub_far = sus.scorecard_v2(roads, far, d00, flat, env_a)
+    assert sub_near["amenity"] > sub_far["amenity"]
+
+    # T6: congestion — redundant grid beats single spine with cul-de-sacs
+    grid_r = np.zeros((GRID, GRID), np.uint8)
+    for i in range(20, GRID - 20, 20):
+        grid_r[i, 20:GRID - 20] = 1
+        grid_r[20:GRID - 20, i] = 1
+    spine = np.zeros((GRID, GRID), np.uint8)
+    spine[64, 10:118] = 1
+    for x in range(20, 110, 12):
+        spine[52:64, x] = 1
+    assert sus.congestion_bottleneck(grid_r) > sus.congestion_bottleneck(spine)
+
+    # T7: equity — lifting the worst-served beats boosting the best-served
+    dens_eq = np.zeros((GRID, GRID), np.float32)
+    dens_eq[10:20, 10:20] = 0.5             # well-served block
+    dens_eq[100:110, 100:110] = 0.5         # poorly-served block
+    served_a = np.zeros((GRID, GRID)); served_a[10:20, 10:20] = 1.0
+    served_b = np.zeros((GRID, GRID))
+    served_b[10:20, 10:20] = 0.6; served_b[100:110, 100:110] = 0.6
+    assert sus.access_equity(served_b, dens_eq) > sus.access_equity(served_a, dens_eq)
+    served_pad = served_b.copy()            # reach painted over empty forest
+    served_pad[30:50, 30:50] = 1.0          # ... must not change equity
+    assert abs(sus.access_equity(served_pad, dens_eq) -
+               sus.access_equity(served_b, dens_eq)) < 1e-9
+
+    # T8: performance and determinism of the full scorecard
+    rng = np.random.default_rng(3)
+    elev8 = fractal_heightmap(rng)
+    t0 = _time.time()
+    r1 = sus.scorecard_v2(grid_r, near, d00, elev8, env_a)
+    dt = _time.time() - t0
+    r2 = sus.scorecard_v2(grid_r, near, d00, elev8, env_a)
+    assert dt < 3.0, f"scorecard too slow: {dt:.2f}s"
+    assert r1[0] == r2[0] and r1[1] == r2[1]
+    print(f"acceptance T1-T8 ok (scorecard {dt*1000:.0f} ms)")
+
+
+def test_verifier_regressions():
+    """Regression tests for the defects found in verification round 1."""
+    import sustainability as sus
+    flat = np.zeros((GRID, GRID), dtype=np.float32)
+
+    # R1 (CRITICAL): pre-existing switchback on a steep slope is NOT new dev
+    steep = np.tile((np.arange(GRID) * 15.0
+                     * math.tan(math.radians(40))).astype(np.float32),
+                    (GRID, 1))
+    roads0 = np.zeros((GRID, GRID), np.uint8)
+    roads0[30:100, 90] = 1                  # old road on 40-deg slope
+    d0 = np.zeros((GRID, GRID), np.float32)
+    d0[40:60, 10:30] = 0.5                  # town on the flat-ish low side
+    env_s = _fake_env(steep)
+    do_nothing = sus.scorecard_v2(roads0, d0, d0, steep, env_s, roads0=roads0)
+    assert do_nothing[1]["landslide"] == 1.0, do_nothing[1]["landslide"]
+    builds_on_slope = d0.copy()
+    builds_on_slope[30:50, 85:95] = 0.4
+    on_slope = sus.scorecard_v2(roads0, builds_on_slope, d0, steep, env_s,
+                                roads0=roads0)
+    assert on_slope[1]["landslide"] < 0.2, on_slope[1]["landslide"]
+
+    # R2 (BUG): a present-but-unreachable amenity category lowers M1
+    roads = np.zeros((GRID, GRID), np.uint8)
+    roads[64, :] = 1
+    reachable = {"food": [(64, 20)]}
+    plus_unreachable = {"food": [(64, 20)], "health": [(20, 20)]}  # off-road
+    dens = np.zeros((GRID, GRID), np.float32)
+    dens[60:68, 15:35] = 0.4
+    s1, n1 = sus.amenity_access(dens, roads, reachable)
+    s2, n2 = sus.amenity_access(dens, roads, plus_unreachable)
+    r = dens > sus.DENSITY_THR
+    assert n1 == 1 and n2 == 2
+    assert s2[r].mean() < s1[r].mean(), "unreachable category must dilute M1"
+
+    # R3 (BUG): compact connected block is not circuitous
+    block = np.zeros((GRID, GRID), np.uint8)
+    block[60:64, 60:64] = 1
+    assert sus.circuity(block) == 1.0
+
+    # R4 (DESIGN): do-nothing loses best-of-N to comparable real growth
+    env_f = _fake_env(flat, amenities={"food": [(64, 40)]})
+    roads_g = np.zeros((GRID, GRID), np.uint8)
+    roads_g[64, 30:90] = 1
+    roads_g[50:80, 60] = 1
+    grown = d0.copy()
+    grown[55:75, 45:75] = 0.4
+    order, scores = sus.rank_samples([(roads_g, d0), (roads_g, grown)],
+                                     d0, flat, env=env_f, roads0=roads_g)
+    assert order[0] == 1, (order, {i: round(t, 1) for i, (t, _) in scores.items()})
+    print("verifier regressions R1-R4 ok")
+
+
 if __name__ == "__main__":
     test_tile_math()
     test_make_sample_v2()
     test_bikelane_graph()
     test_sustainability()
+    test_acceptance_v2()
+    test_verifier_regressions()
     print("all v2 smoke tests passed")
