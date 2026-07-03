@@ -29,7 +29,10 @@ def train(args):
     ds = ExpansionDataset(args.data)
     dl = DataLoader(ds, batch_size=args.batch, shuffle=True,
                     num_workers=2 if device == "cuda" else 0, drop_last=True)
-    model = UNet(base=args.base).to(device)
+    # channel counts are inferred from the dataset, so v1/v2 (2-channel
+    # targets) and v3 (3-channel: +amenity density) share this trainer
+    cond_ch, out_ch = ds.cond.shape[1], ds.target.shape[1]
+    model = UNet(cond_ch=cond_ch, out_ch=out_ch, base=args.base).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[train] device={device} samples={len(ds)} params={n_params/1e6:.1f}M")
     diff = Diffusion(model, device)
@@ -58,7 +61,8 @@ def train(args):
         print(f"[train] epoch {epoch+1}/{args.epochs} loss={avg:.4f} "
               f"({time.time()-t0:.0f}s)")
         if (epoch + 1) % args.ckpt_every == 0 or epoch + 1 == args.epochs:
-            ema_model = UNet(base=args.base).to(device)
+            ema_model = UNet(cond_ch=cond_ch, out_ch=out_ch,
+                             base=args.base).to(device)
             ema.copy_to(ema_model)
             torch.save({"model": model.state_dict(),
                         "ema": ema_model.state_dict(),

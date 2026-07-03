@@ -72,6 +72,7 @@ class SelfAttention(nn.Module):
 class UNet(nn.Module):
     def __init__(self, cond_ch=4, out_ch=2, base=64, t_dim=256):
         super().__init__()
+        self.cond_ch, self.out_ch = cond_ch, out_ch
         self.t_emb = nn.Sequential(SinusoidalEmb(t_dim),
                                    nn.Linear(t_dim, t_dim), nn.SiLU(),
                                    nn.Linear(t_dim, t_dim))
@@ -132,7 +133,8 @@ class Diffusion:
     @torch.no_grad()
     def sample_ddim(self, cond, steps=50, eta=0.0, generator=None):
         b = cond.shape[0]
-        x = torch.randn(b, 2, cond.shape[2], cond.shape[3],
+        out_ch = getattr(self.model, "out_ch", 2)  # v3 models emit 3
+        x = torch.randn(b, out_ch, cond.shape[2], cond.shape[3],
                         device=self.device, generator=generator)
         ts = torch.linspace(self.t_steps - 1, 0, steps, device=self.device).long()
         for i, t in enumerate(ts):
