@@ -57,8 +57,9 @@ with open("runs/v2/bike_clf.pkl", "wb") as f:
     pickle.dump(clf, f)""")
 
 md("""## 4. Sustainable best-of-N sampling on a held-out town
-Sample 16 futures, rank by the sustainability scorecard, show the top 3
-with their 15-minute walk-time maps and bike-lane annotations.""")
+Sample 16 futures, rank with the 11-metric scorecard (real amenities,
+greenspace, flood/landslide proxies, congestion, access equity), show the
+top 3 with walk-time maps and bike-lane annotations.""")
 code("""import numpy as np, torch, matplotlib.pyplot as plt
 from towns import TEST_TOWNS
 from data import binary_dilate
@@ -72,6 +73,10 @@ name, lat, lon = TEST_TOWNS[0]
 elev = fetch_elevation(lat, lon)
 roads_now, _ = rasterize_osm(fetch_osm(lat, lon), lat, lon)
 d_now = sample_density(lat, lon, 2020, cache_dir="data/ghsl_cache")
+from environment import fetch_environment
+env = fetch_environment(lat, lon, elev)
+print("amenity categories present:",
+      [c for c, p in env["amenities"].items() if p])
 
 ez = np.clip((elev - elev.mean()) / (elev.std() + 1e-6), -3, 3) / 3.0
 from data import slope_from_elevation
@@ -97,11 +102,13 @@ for i in range(N):
     roads_all = np.maximum(roads_now, new_roads)
     cands.append((roads_all, dens_new))
 
-order, scores = sus.rank_samples(cands, d_now, elev)
+order, scores = sus.rank_samples(cands, d_now, elev, env=env,
+                                 roads0=roads_now)
 print(f"{name}: best {scores[order[0]][0]:.0f}, "
       f"median {scores[order[N // 2]][0]:.0f}, worst {scores[order[-1]][0]:.0f}")
 for i in order[:3]:
-    print(i, {k: round(v, 2) for k, v in scores[i][1].items()})
+    print(i, {k: round(v, 2) for k, v in scores[i][1].items()
+              if not k.startswith("_")})
 
 fig, axes = plt.subplots(3, 3, figsize=(12, 12))
 for row, i in enumerate(order[:3]):
