@@ -30,22 +30,27 @@ that make up most settlements worldwide---and especially for towns in
 hilly regions of Europe and Asia---topography is a first-order constraint
 on where streets and buildings can go. We present a conditional denoising
 diffusion model that generates street-level expansion layouts (road
-rasters and built-up area) for small towns, conditioned jointly on
-terrain (elevation and slope) and the existing settlement footprint. The
-model is trained on windows around approximately sixty towns in hilly
-terrain across Europe and Asia, assembled automatically from
-OpenStreetMap vectors and open elevation tiles, using a concentric-erosion
-proxy to recover core/expansion training pairs from present-day
-footprints. A single trained model supports two inference modes: a
-\emph{real mode}, which proposes expansions for actual towns, and a
-\emph{sandbox mode}, in which the model is applied iteratively to an
-arbitrary heightmap so that a settlement grows step by step, in the manner
-of a city-building game. On held-out towns, generated expansions track the
-slope-occupancy statistics of real growth substantially better than a
-slope-blind baseline while maintaining road connectivity to the existing
-network. We release code, the town list, and the training pipeline.
-\textcolor{red}{[RESULTS-PLACEHOLDER: final numbers inserted from
-evaluation run.]}
+rasters and continuous built-up density) for small towns, conditioned
+jointly on terrain (elevation and slope) and the observed settlement
+state. The model is trained on windows around approximately sixty towns
+in hilly terrain across Europe and Asia, assembled automatically from
+OpenStreetMap vectors, open elevation tiles, and the multi-epoch
+GHS-BUILT-S built-up surface, whose 1980--2020 epochs provide real
+temporal supervision: each sample conditions on the town as observed at
+one epoch and targets the next. A concentric-erosion proxy that
+manufactures pseudo-temporal pairs from a single snapshot, used in an
+earlier version of this work, is retained as a baseline. An
+eleven-metric raster scorecard---covering 15-minute amenity access,
+infill, land efficiency, hazard avoidance, green preservation, and
+access equity---turns the sampler into an optimizer by best-of-$N$
+selection, and post-hoc classifiers annotate selected plans with bike
+infrastructure and typed zones. Training converges from 0.744 to
+approximately 0.04 noise-prediction loss over 120 epochs; we show
+top-ranked generated futures for a held-out town with per-pixel
+walk-time maps, specify the held-out evaluation protocol, and release
+code, the town list, and the full pipeline. A single trained model
+supports proposal generation for real towns, iterative sandbox growth on
+arbitrary heightmaps, and continuation of user-drawn plans.
 \end{abstract}
 
 \section{Introduction}
@@ -90,22 +95,33 @@ on European and Asian data---is, to our knowledge, unoccupied.
 Our contributions are:
 \begin{enumerate}
 \item A fully automatic data pipeline that assembles terrain-conditioned
-expansion training pairs for arbitrary towns from OpenStreetMap and open
-elevation tiles, requiring no manual annotation and no API keys, together
-with a curated list of $\sim$60 training and 8 held-out small towns in
-hilly terrain across Europe and Asia.
-\item A concentric-erosion proxy that recovers (core, expansion-ring)
-supervision pairs from a single present-day snapshot, sidestepping the
-scarcity of historical street-level data for small towns; we state its
-assumptions and failure modes explicitly.
+growth training pairs for arbitrary towns from OpenStreetMap, open
+elevation tiles, and the multi-epoch GHS-BUILT-S built-up surface
+\citep{pesaresi2023ghsl}, requiring no manual annotation and no API keys,
+together with a curated list of $\sim$60 training and 8 held-out small
+towns in hilly terrain across Europe and Asia. Supervision is real
+temporal change between observed epochs (1980--2020); the
+concentric-erosion proxy of the first version of this work, which
+recovers pseudo-temporal pairs from a single snapshot, is kept as a
+baseline and ablation, and we state the temporal proxy that remains
+(roads) explicitly.
 \item A compact ($\sim$13M parameter) conditional diffusion model that
-generates joint road/built-up expansion rasters, and an evaluation
-protocol measuring slope compliance, road connectivity, and built-up
-contiguity against a slope-blind baseline on held-out towns.
-\item A demonstration that one trained model supports both proposal
-generation for real towns and iterative, game-like growth of synthetic
-settlements on arbitrary heightmaps, which we discuss as the
-decision-making layer of a prospective automated city-building agent.
+generates joint road/built-density growth rasters, where density is
+continuous so that infill densification and greenfield sprawl are both
+supervised and both generable.
+\item An eleven-metric sustainability scorecard, computed directly on
+rasters and the extracted road graph against real OSM amenities,
+greenspace, and terrain hazard proxies, that turns the sampler into an
+optimizer via best-of-$N$ selection without retraining.
+\item Post-hoc annotation stages---a slope-aware bike-infrastructure edge
+classifier and a typed-zone classifier---that add planning detail the
+diffusion targets cannot carry, each with a leave-one-town-out transfer
+protocol.
+\item A demonstration that one trained model supports proposal generation
+for real towns, iterative game-like growth of synthetic settlements on
+arbitrary heightmaps, and (in the v3 extension) continuation of
+user-drawn plans, which we discuss as the decision-making layer of a
+prospective automated city-building agent.
 \end{enumerate}
 
 \section{Related Work}
@@ -136,7 +152,10 @@ with support vector machines \citep{rienow2015svm} or deep networks
 urban growth from satellite time series \citep{boulila2024convlstm}.
 These models incorporate terrain but output coarse urbanisation
 probabilities rather than street-level layouts; they simulate
-\emph{whether} a cell urbanises, not \emph{what is built}.
+\emph{whether} a cell urbanises, not \emph{what is built}. Our temporal
+supervision draws on the same class of multi-epoch built-up products
+these models consume \citep{pesaresi2023ghsl}, but uses them as diffusion
+targets rather than CA calibration data.
 
 \subsection{Terrain and geospatial generation}
 Diffusion models generate realistic terrain from text or sketches
@@ -160,31 +179,57 @@ APIs in Section~\ref{sec:applications}.
 
 \subsection{Problem formulation}
 Let $E \in \mathbb{R}^{H \times W}$ be an elevation raster over a
-window of $\sim$1.9\,km ($H{=}W{=}128$ at 15\,m/px), $S$ its slope, and
-$(R_c, B_c)$ binary rasters of the \emph{core} road network and built-up
-area. The model learns the conditional distribution
-$p(R_r, B_r \mid E, S, R_c, B_c)$ over \emph{ring} (expansion) roads and
-built-up area. Conditioning channels are concatenated: elevation is
-z-scored per window and clipped to $\pm 3\sigma$; slope is normalised by
-$30^\circ$. Targets are mapped to $\{-1, 1\}$.
+window of $\sim$1.9\,km ($H{=}W{=}128$ at 15\,m/px), $S$ its slope,
+$D_t \in [0,1]^{H \times W}$ the observed built-up density at epoch $t$
+(the built fraction of each cell), and $R_t$ a binary raster of the
+road network inside the epoch-$t$ settlement footprint. The model learns
+the conditional distribution
+$p(R_{\mathrm{new}}, D_{t+1} \mid E, S, D_t, R_t)$ over roads outside
+the epoch-$t$ footprint and the next-epoch density field. Conditioning
+channels are concatenated: elevation is z-scored per window and clipped
+to $\pm 3\sigma$; slope is normalised by $30^\circ$; density is used
+directly. Targets are affinely mapped to $[-1, 1]$ (binary road targets
+to $\{-1, 1\}$). Because density is continuous rather than a binary
+footprint, the target expresses both infill densification (cells that
+were already built getting denser) and greenfield sprawl (new cells),
+and both are supervised.
 
-\subsection{Growth supervision by concentric erosion}
+\subsection{Temporal supervision from multi-epoch built-up data}
+\label{sec:temporal}
+The primary training regime replaces manufactured growth pairs with
+observed ones. GHS-BUILT-S R2023A \citep{pesaresi2023ghsl} provides a
+global built-up surface at 3 arc-seconds on the WGS84 tile grid for the
+epochs 1980, 1990, 2000, 2010, and 2020; our pipeline downloads and
+caches the relevant $10^\circ$ tiles once and performs windowed reads
+per town. For each town and each consecutive epoch pair $(t, t{+}1)$
+with sufficient observed growth we emit one sample: the model conditions
+on elevation, slope, the observed density $D_t$, and roads clipped to
+the epoch-$t$ footprint, and targets $D_{t+1}$ together with roads
+outside that footprint. Windows whose epoch pair shows too little change
+are dropped automatically.
+
+One honest proxy remains. OpenStreetMap carries no road history for
+these towns, so ``roads at epoch $t$'' are necessarily present-day OSM
+roads restricted to where density was already non-zero at epoch $t$.
+Roads built later inside an old footprint therefore leak into early-epoch
+conditioning; we flag the consequences in
+Section~\ref{sec:limitations}. The built-up channels, which carry the
+growth signal itself, are genuinely temporal.
+
+\subsection{The concentric-erosion proxy (v1 baseline)}
 \label{sec:erosion}
-Historical street-level data for small towns is scarce and inconsistent
-across countries. We instead construct supervision from present-day
-snapshots: the observed built-up mask $B$ is eroded with a disc of radius
-$\rho = 10$\,px ($\approx$150\,m) to produce a pseudo-historical core
-$B_c$, and the ring $B_r = B \setminus B_c$ becomes the generation
-target; ring roads are defined analogously. The proxy assumes
-predominantly outward, concentric growth. This assumption is reasonable
-for compact hill towns, whose steep surroundings suppress leapfrog
-development, but it is wrong for linear valley towns that grow along a
-single axis and for towns whose growth is dominated by infill. We keep
-the proxy because it makes the pipeline fully automatic, and we flag the
-resulting bias in Section~\ref{sec:limitations}. Nothing in the
-architecture depends on it: given true temporal pairs (e.g.\ from
-historical cadastral data or multi-epoch built-up products), the same
-model trains unchanged.
+The first version of this work constructed supervision from present-day
+snapshots alone: the observed built-up mask $B$ was eroded with a disc of
+radius $\rho = 10$\,px ($\approx$150\,m) to produce a pseudo-historical
+core $B_c$, and the ring $B_r = B \setminus B_c$ became the generation
+target, with ring roads defined analogously. The proxy assumes
+predominantly outward, concentric growth---reasonable for compact hill
+towns whose steep surroundings suppress leapfrog development, wrong for
+linear valley towns and for growth dominated by infill, and structurally
+incapable of expressing densification, since its targets are binary. We
+retain it as a baseline and ablation: the channel counts match the
+temporal regime, so the same architecture trains on either supervision
+unchanged, which is precisely what makes the comparison clean.
 
 \subsection{Architecture and training}
 A U-Net with three resolution levels (64/128/256 channels), residual
@@ -192,21 +237,157 @@ blocks, sinusoidal timestep embeddings, and self-attention at the two
 coarsest resolutions predicts the added noise $\epsilon$ under a cosine
 noise schedule with $T{=}1000$ steps \citep{ho2020ddpm,
 nichol2021improved}. The 4 conditioning channels are concatenated to the
-2 noisy target channels at the input ($\sim$13M parameters). We train
+noisy target channels at the input ($\sim$13M parameters). We train
 with AdamW, cosine learning-rate decay, gradient clipping at 1.0, and an
 EMA of the weights (decay 0.999); sampling uses 50 DDIM steps
 \citep{song2021ddim}. Each town window is augmented by the dihedral
 group (8 orientations) and small centre jitter.
 
-\subsection{Two inference modes}
+\subsection{Inference modes}
 \textbf{Real mode.} For a real town, the pipeline fetches current
-elevation and OSM rasters, erodes to a core exactly as in training, and
-samples an expansion conditioned on the true terrain.
+elevation, OSM rasters, and the latest GHSL epoch, and samples a
+next-epoch density and road increment conditioned on the true terrain
+and observed state.
 \textbf{Sandbox mode.} For an arbitrary heightmap (fractal noise here; a
 game-exported heightmap in principle), a seed settlement of a few pixels
 is placed on low-slope ground and the model is applied iteratively: the
-union of the previous state and the generated ring becomes the next
-core. Each round is one ``turn'' of automated play.
+union of the previous state and the generated increment becomes the next
+conditioning state. Each round is one ``turn'' of automated play. The
+plan-import mode of Section~\ref{sec:extensions} generalises this by
+letting a human drawing, rather than a seed, initialise the state.
+
+\section{Sustainability evaluation and best-of-\texorpdfstring{$N$}{N} selection}
+\label{sec:sustainability}
+
+A generative model of plausible growth is not yet a planning tool: a
+planner needs to know which of many plausible futures is \emph{better}.
+We therefore attach an eleven-metric raster scorecard that grades any
+(roads, density) plan against its terrain and environmental context, and
+use it for best-of-$N$ selection: sample $N$ futures from the diffusion
+model, score each, keep the top-ranked ones. This turns the sampler into
+an optimizer without retraining, and the same scorecard grades real
+draft plans for critique.
+
+The context layers are fetched once per town: real OSM amenities in
+seven categories (food, education, health, civic, recreation, transit,
+social), greenspace and water masks, and two terrain hazard proxies
+derived from the DEM. The metrics, each normalised to $[0,1]$, are:
+
+\begin{itemize}
+\item \textbf{15-minute amenity coverage} (weight 0.18): per-pixel
+network walk times are computed by Dijkstra over road pixels at
+80\,m/min with a 15-minute (1200\,m) budget, with real OSM amenities as
+fixed destinations; coverage is the built-weighted served fraction over
+the amenity categories \emph{present in the window}, so small towns are
+compared on what exists. A category that exists but is unreachable over
+the network contributes zero while remaining in the denominator.
+\item \textbf{Infill share} (0.10): fraction of new growth inside the
+existing footprint rather than greenfield.
+\item \textbf{Land efficiency} (0.08): added density per newly consumed
+pixel.
+\item \textbf{Circuity} (0.06): network over straight-line distance
+between sampled road-pixel pairs.
+\item \textbf{Earthwork} (0.06): mean terrain slope under \emph{new}
+roads, a grading-cost and erosion-risk proxy.
+\item \textbf{Green preservation} (0.10): survival of \emph{baseline}
+functional green patches ($\geq$0.45\,ha); new green elsewhere cannot
+buy back cleared green, and new roads clear green just as buildings do.
+\item \textbf{Green access} (0.08): share of built pixels within a
+300\,m network walk of a remaining functional green patch.
+\item \textbf{Flood avoidance} (0.10): new development on flood-prone
+cells, flagged by a HAND proxy---height above the nearest mapped water
+under 5\,m within $\sim$105\,m of water.
+\item \textbf{Landslide avoidance} (0.08): new development on slopes
+above $25^\circ$, with slopes above $35^\circ$ counted double.
+\item \textbf{Congestion proxy} (0.08): one minus the Gini coefficient
+of edge betweenness on the road graph extracted from the raster, so
+plans that funnel all traffic through one link score low.
+\item \textbf{Access equity} (0.08): population-weighted dispersion of
+per-cell amenity coverage, penalising plans that serve the centre and
+strand the periphery.
+\end{itemize}
+
+Weights sum to one. Hazard and earthwork terms are computed over new
+development only, so a town's pre-existing switchbacks are not held
+against a plan. Ranking applies a growth-delivery factor, so a
+do-nothing plan cannot win best-of-$N$ simply by avoiding every hazard:
+the scorecard rewards delivering growth well, not refusing to grow.
+
+Two boundaries are deliberate. The metrics are spatial-form proxies
+computed from rasters---HAND and slope thresholds are not hydraulic or
+geotechnical models, and no score here certifies environmental
+performance. And socioeconomic factors---income, tenure, affordability,
+displacement risk---are named as required human inputs and deliberately
+not fabricated from rasters. As a methods-transparency note: the metric
+design came from a multi-perspective specification (ecologist, transport
+engineer, geotechnical engineer, equity planner) and the implementation
+survived a two-round adversarial verification loop that caught one
+critical defect---pre-existing roads scored as new development---before
+acceptance.
+
+\section{Post-hoc annotation stages}
+\label{sec:posthoc}
+
+Two planning layers are kept out of the diffusion targets because their
+OSM labels are too sparse in the training towns to supervise generation;
+both are instead trained where labels are dense and applied to generated
+rasters, with leave-one-town-out protocols so the transfer claim is
+testable rather than asserted.
+
+\subsection{Bike-infrastructure edge classification}
+Cycleway tagging is dense in the flat cycling countries and nearly
+absent in mountain towns, so bike lanes are a per-edge classifier, not a
+generated channel. We train a logistic classifier on twelve well-tagged
+flat European towns (Dutch, Danish, and north-German), using physical
+features that transfer across morphology: mean absolute grade along the
+edge computed from the DEM, road class, edge length, and the edge's
+position relative to the town centre. Evaluation is leave-one-town-out.
+At inference, a skeleton-to-graph extractor converts any generated road
+raster into junction-to-junction polylines, and every edge receives a
+bike-infrastructure probability---so a plan selected in
+Section~\ref{sec:sustainability} arrives annotated with the edges where
+protected cycling infrastructure is physically plausible.
+
+\subsection{Typed zones}
+The diffusion model generates one undifferentiated density field; a
+planner needs to know where residential, commercial, industrial, and
+institutional uses go. OSM landuse polygons provide labels, but they are
+patchy outside Europe and heavily imbalanced toward residential, so
+zoning is likewise a post-hoc per-pixel classifier trained only where
+labels exist, on features the generator already produces (distance to
+centre, slope, road proximity, local density, amenity density, local
+road density), with per-class caps against residential dominance.
+Evaluation is leave-one-town-out macro-F1; at inference the classifier
+paints use classes onto new development.
+
+\section{Extensions in progress (v3)}
+\label{sec:extensions}
+
+Three extensions are implemented in the released pipeline and currently
+training; we describe them as method and claim no results for them.
+
+\textbf{Generated amenity channel.} The v2 scorecard measures access
+against \emph{existing} amenities only, which correctly penalises remote
+growth but cannot express ``grow here and put a school there.'' v3 adds
+a third target channel of log-scaled amenity density rasterised from OSM
+points, so the model learns where local centres sit relative to fabric
+and, at sampling time, \emph{proposes} amenity locations for new growth.
+The scorecard reports access both with and without the proposed
+amenities, so the assumption stays visible rather than laundering
+optimism into the headline score.
+
+\textbf{Plan import.} A user-drawn plan image following a simple
+convention---black lines for roads, warm colours for built area, green
+kept free---is parsed into conditioning rasters and continued by the
+model, over real terrain, a supplied heightmap, or procedural relief.
+This generalises sandbox mode: the initial state comes from a human
+drawing instead of a seed pixel, and the conditioning layout is
+unchanged, so any v2/v3 checkpoint works.
+
+\textbf{Plan-style rendering.} Raw model rasters are hard for humans to
+read, so a rendering stage composes hillshaded terrain, roads, zone
+colours, green and water, and proposed local centres into a planning-map
+figure with a legend and scale bar.
 
 \section{Experiments}
 
@@ -214,30 +395,85 @@ core. Each round is one ``turn'' of automated play.
 $\sim$60 training towns and 8 held-out towns (population roughly
 5k--60k) in hilly regions of Europe (Alps, Apennines, Iberia, Balkans)
 and Asia (Japan, the Indian Himalaya and Western Ghats, Nepal, Vietnam,
-Indonesia, Turkey, the Caucasus), listed in the repository. Windows with
-insufficient settlement are dropped automatically.
-\textcolor{red}{[RESULTS-PLACEHOLDER: final sample counts.]}
+Indonesia, Turkey, the Caucasus), listed in the repository. Each town
+contributes up to four consecutive GHSL epoch pairs
+(1980$\to$1990 through 2010$\to$2020); pairs with insufficient observed
+growth are dropped automatically, and each surviving window is expanded
+eightfold by dihedral augmentation. The exact per-run sample manifest is
+produced by the released pipeline.
 
-\subsection{Metrics and baseline}
-On each held-out town we compare the generated ring to the real ring:
+\subsection{Evaluation protocol}
+On each held-out town the protocol compares the generated increment to
+the real next-epoch change:
 \textbf{Slope KS} --- Kolmogorov--Smirnov distance between the slope
-distributions under generated vs.\ real ring built-up pixels (lower is
+distributions under generated vs.\ real new built-up pixels (lower is
 better; measures whether the model builds on the kinds of slopes the
 town actually built on);
 \textbf{Road connectivity} --- fraction of generated road pixels
-8-connected to the core network;
-\textbf{Built contiguity} --- fraction of generated ring pixels adjacent
+8-connected to the existing network;
+\textbf{Built contiguity} --- fraction of new built pixels adjacent
 to at least two settlement pixels;
-\textbf{Volume ratio} --- generated/real ring area.
-The baseline scatters the same built area uniformly at random over the
-window (slope-blind), a deliberately weak control that isolates whether
-the model uses terrain at all.
+\textbf{Volume ratio} --- generated/real new built area;
+plus ordinal density-class agreement derived by binning the continuous
+density channel.
+Two comparisons are planned: a slope-blind baseline that scatters the
+same built mass uniformly at random over the window (a deliberately weak
+control that isolates whether the model uses terrain at all), and the
+erosion-trained v1 model as an ablation of the temporal supervision. The
+protocol is implemented in the released pipeline; we do not report
+held-out numbers in this version because that evaluation run has not
+completed, and we prefer an empty cell to an invented one. For the
+post-hoc stages, the corresponding protocols are leave-one-town-out AUC
+(bike edges) and leave-one-town-out macro-F1 (zones), likewise shipped
+with the code.
 
 \subsection{Results}
-\textcolor{red}{[RESULTS-PLACEHOLDER: table of metrics, model vs
-baseline, overall and split by Europe/Asia; loss curve; qualitative
-figures for real-mode case studies; sandbox growth sequence figure;
-discussion of what the numbers show, written after the numbers exist.]}
+\textbf{Training.} The v2 temporal regime trains stably: the
+noise-prediction MSE falls from 0.744 at the first epoch to
+$\sim$0.040 by epoch 120 (final-epoch 0.036, mean of the last ten epochs
+0.039), with no divergence and the familiar fast-then-slow diffusion
+profile (Figure~\ref{fig:loss}). We read this only as evidence that the
+continuous-density temporal targets are learnable by the unchanged v1
+architecture; training loss is not a fidelity claim.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.62\linewidth]{figures/loss_curve.pdf}
+\caption{Training loss of the v2 model (noise-prediction MSE, log
+scale) over 120 epochs on the GHSL temporal pairs: 0.744 at epoch 1 to
+$\sim$0.040 at epoch 120.}
+\label{fig:loss}
+\end{figure}
+
+\textbf{Qualitative selection results.} Figure~\ref{fig:topk} shows the
+pipeline end to end on a held-out town: many futures are sampled, the
+scorecard of Section~\ref{sec:sustainability} ranks them, and the top
+three are shown with their per-pixel walk-time maps and bike-lane
+annotations. The three selected futures score within one point of each
+other (51, 50, 50 of 100) while proposing visibly different spatial
+arrangements, and their 15-minute amenity coverage of built pixels
+ranges from 82\% to 87\%---which is the intended behaviour of best-of-$N$
+selection: several near-equivalent good options for a human to choose
+among, not a single oracle answer. The density fields are speckled at
+the pixel level, as raw diffusion rasters are; the rendering stage of
+Section~\ref{sec:extensions} exists precisely because these rasters are
+for scoring, not for reading.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/sustainable_topk.png}
+\caption{Top-3 of $N$ sampled futures for a held-out town, ranked by
+the eleven-metric scorecard (rows; total scores 51, 50, 50 of 100).
+Left: generated continuous built-density channel. Centre: per-pixel
+walk time along the generated road network to the nearest real OSM
+amenity (Dijkstra at 80\,m/min), with the share of built pixels inside
+the 15-minute budget given per sample (86\%, 82\%, 87\%). Right: road
+pixels (black) with graph edges whose predicted bike-infrastructure
+probability exceeds 0.5 overlaid in warm colours by the post-hoc
+classifier of Section~\ref{sec:posthoc}. These are raw model rasters,
+deliberately shown without the plan-style rendering stage.}
+\label{fig:topk}
+\end{figure}
 
 \section{Applications: towards automated city-building agents}
 \label{sec:applications}
@@ -247,31 +483,52 @@ complete agent for a title such as Cities: Skylines~2 additionally needs
 perception (reading the game's heightmap and current road/zone state,
 available through its modding API) and actuation (executing placements,
 also exposed to mods). Because our model consumes and produces rasters,
-the integration surface is thin. We do not implement it here; we note
-that raster-to-game-geometry conversion (vectorising road rasters into
-placeable splines) is the main engineering step.
+the integration surface is thin, and the plan-import mode of
+Section~\ref{sec:extensions} already parses drawn or exported maps into
+conditioning. We do not implement the agent here; we note that
+raster-to-game-geometry conversion (vectorising road rasters into
+placeable splines) is the main engineering step, and the
+skeleton-to-graph extractor of Section~\ref{sec:posthoc} is most of it.
 
 \section{Limitations}
 \label{sec:limitations}
-The concentric-erosion proxy biases training toward ring-like growth
-(Section~\ref{sec:erosion}); multi-epoch built-up products such as GHSL
-would provide true temporal supervision at coarser spatial detail. OSM
-completeness varies across Asia, under-representing buildings in some
-towns; our built-up masks partially compensate with land-use polygons.
-Rasters at 15\,m/px cannot represent parcel-level structure. The
-evaluation baseline is deliberately weak; comparison against SLEUTH-class
-CA models and layout generators retrofitted with terrain channels is
-future work. Generated layouts are proposals, not plans: no zoning law,
-hydrology, hazard, or land-ownership information enters the model.
-\textcolor{red}{[RESULTS-PLACEHOLDER: any additional limitations
-observed in the actual training run.]}
+\textbf{Temporal road proxy.} OSM has no road history, so epoch-$t$
+roads are present-day roads clipped to the epoch-$t$ footprint
+(Section~\ref{sec:temporal}). Roads built recently inside an old
+footprint leak into early-epoch conditioning, making the conditioning
+network denser than the town actually was; the density channels are
+unaffected.
+\textbf{Density granularity.} GHS-BUILT-S is native $\sim$100\,m
+(3 arc-second) resolution resampled to our 15\,m/px grid, so the
+density target is smoother than the road raster and cannot carry
+parcel-level structure; the road channel and the 15\,m DEM carry the
+fine detail.
+\textbf{Label sparsity outside Europe.} OSM amenity, landuse, and
+cycleway coverage thins outside Europe, so the scorecard's destination
+set is less complete in the Asian towns and the post-hoc classifiers are
+trained on European labels; leave-one-town-out transfer is tested only
+within that labelled pool.
+\textbf{Window scale.} 1.9\,km windows exclude transit-scale
+structure---tram or rail corridors, and anything that only makes sense
+at city scale---which is why transit appears in the scorecard only as a
+destination category, not as generated infrastructure.
+\textbf{Scorecard scope.} The eleven metrics are spatial-form proxies,
+not certified environmental performance
+(Section~\ref{sec:sustainability}); no zoning law, land ownership,
+budget, or hydraulic model enters the pipeline, and generated layouts
+are proposals, not plans.
+\textbf{Baselines.} The slope-blind control is deliberately weak;
+comparison against SLEUTH-class CA models and layout generators
+retrofitted with terrain channels is future work.
 
 \section{Conclusion}
 We presented a terrain-conditioned diffusion model for street-level
-expansion of small towns, trained on European and Asian data assembled
-fully automatically, evaluated on held-out towns, and usable both as a
-proposal tool for real settlements and as an iterative growth engine on
-arbitrary heightmaps.
+growth of small towns, trained on real 1980--2020 built-up change
+assembled fully automatically from open data, scored and selected by an
+eleven-metric sustainability scorecard, annotated post hoc with bike
+infrastructure and typed zones, and usable as a proposal tool for real
+settlements, an iterative growth engine on arbitrary heightmaps, and a
+continuation engine for human-drawn plans.
 
 \section*{AI assistance disclosure}
 The code, experiments, and text of this paper were produced with
@@ -397,6 +654,13 @@ A.~Nichol and P.~Dhariwal.
 J.~Song, C.~Meng, and S.~Ermon.
 \newblock Denoising diffusion implicit models.
 \newblock In \emph{ICLR}, 2021.
+
+\bibitem[Pesaresi et~al.(2023)]{pesaresi2023ghsl}
+M.~Pesaresi, P.~Politis, et~al.
+\newblock GHS-BUILT-S R2023A: GHS built-up surface grid, derived from
+Sentinel-2 composite and Landsat, multitemporal (1975--2030).
+\newblock European Commission, Joint Research Centre (JRC), 2023.
+\newblock \url{https://ghsl.jrc.ec.europa.eu/}.
 
 \bibitem[Wei et~al.(2026)]{wei2026terradit}
 B.~Wei, S.~Sastry, D.~Cher, E.~Xing, and N.~Jacobs.
