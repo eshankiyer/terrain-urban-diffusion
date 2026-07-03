@@ -42,7 +42,9 @@ GHSL_URL = ("https://jeodpp.jrc.ec.europa.eu/ftp/jrc-opendata/GHSL/"
 TILE_DEG = 10.0        # each GHSL 4326 tile spans 10 x 10 degrees
 TILE_PX = 12000        # at 3 arc-seconds
 NODATA = 65535
-MIN_GROWTH_PX = 60     # minimum number of pixels with meaningful growth
+MIN_GROWTH_PX = 30     # minimum pixels of meaningful growth per epoch pair
+                       # (lowered from 60: slow-growing towns still teach
+                       # infill, and 36 pairs was too few to train on)
 FOOTPRINT_THR = 0.03   # density above this counts as "already built"
 
 
