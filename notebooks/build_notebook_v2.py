@@ -30,7 +30,7 @@ assert torch.cuda.is_available(), "Switch runtime to GPU: Runtime > Change runti
 print(torch.cuda.get_device_name(0))
 !git clone -b v2 {REPO_URL} /content/repo 2>/dev/null || (cd /content/repo && git fetch && git checkout v2 && git pull)
 %cd /content/repo
-!pip -q install -r requirements.txt tifffile zarr scikit-image scikit-learn networkx scipy
+!pip -q install -r requirements.txt tifffile imagecodecs zarr scikit-image scikit-learn networkx scipy
 sys.path.insert(0, "src")""")
 
 md("""## 0. Smoke test (offline, <1 min) — must pass before the long run""")
