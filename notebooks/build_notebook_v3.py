@@ -30,7 +30,7 @@ assert torch.cuda.is_available(), "Switch runtime to GPU: Runtime > Change runti
 print(torch.cuda.get_device_name(0))
 !git clone -b v3 {REPO_URL} /content/repo 2>/dev/null || (cd /content/repo && git fetch && git checkout v3 && git pull)
 %cd /content/repo
-!pip -q install -r requirements.txt tifffile "imagecodecs==2024.9.22" "numpy==2.0.2" zarr scikit-image scikit-learn networkx scipy
+!pip -q install -r requirements.txt tifffile "imagecodecs==2024.9.22" "numpy==2.0.2" zarr scikit-image scikit-learn networkx scipy onnx onnxscript
 sys.path.insert(0, "src")""")
 
 md("""## 0. Smoke tests (offline, ~1 min) — must pass before the long run""")
@@ -190,6 +190,7 @@ wrap = EpsWrapper(net_cpu)
 dummy = (torch.randn(1, 3, 128, 128), torch.randn(1, 4, 128, 128),
          torch.tensor([500], dtype=torch.int64))
 torch.onnx.export(wrap, dummy, "runs/v3/model.onnx", opset_version=17,
+                  dynamo=False,  # legacy exporter: decomposes 3D attention
                   input_names=["x", "cond", "t"], output_names=["eps"])
 import os
 print("model.onnx:", os.path.getsize("runs/v3/model.onnx") / 1e6, "MB")""")
