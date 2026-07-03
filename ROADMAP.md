@@ -164,6 +164,25 @@ turns 15-minute planning fully generative, with the scorecard reporting
 access both with and without the proposed amenities so the assumption
 stays visible.
 
+## v4 direction: a natural-language planning agent
+
+The end state is conversational: a planner says "this district needs more
+commercial and a school within a ten-minute walk" and the map updates.
+The right architecture keeps the LLM out of the pixel business. An
+open-weights model with function calling (Llama, Qwen, or Mistral served
+locally via Ollama or llama.cpp) parses intent into a small operation
+schema: REGENERATE(region_mask, constraints), SET_ZONE_BIAS(class,
+weight, region), ADD_AMENITY_TARGET(category, region), PROTECT(mask),
+RERANK(weights_override). An executor maps those onto tools that already
+exist in this repo: masked RePaint-style regeneration on the trained
+DDPM (the one new sampler this requires), zone-classifier reweighting,
+amenity-channel biasing, scorecard re-ranking, and plan rendering. The
+LLM never invents geometry; it routes verified operations, and every
+result still passes through the same scorecard, so a request that would
+pave the floodplain gets a low score the planner can see. A browser-only
+variant is possible with WebLLM running a 3B model over WebGPU next to
+the ONNX sampler already on the site.
+
 ## Honest scope
 
 This remains a scenario-generation and critique tool. Land ownership, zoning
