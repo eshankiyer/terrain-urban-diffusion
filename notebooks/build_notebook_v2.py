@@ -28,9 +28,9 @@ towns. **Runtime: GPU (T4 is fine).** GHSL tiles are cached (~30-45 MB each).
 code(f"""import torch, sys
 assert torch.cuda.is_available(), "Switch runtime to GPU: Runtime > Change runtime type"
 print(torch.cuda.get_device_name(0))
-!git clone -b v2 {REPO_URL} repo 2>/dev/null || (cd repo && git fetch && git checkout v2 && git pull)
-%cd repo
-!pip -q install -r requirements.txt tifffile scikit-image scikit-learn
+!git clone -b v2 {REPO_URL} /content/repo 2>/dev/null || (cd /content/repo && git fetch && git checkout v2 && git pull)
+%cd /content/repo
+!pip -q install -r requirements.txt tifffile zarr scikit-image scikit-learn networkx scipy
 sys.path.insert(0, "src")""")
 
 md("""## 0. Smoke test (offline, <1 min) — must pass before the long run""")
@@ -40,10 +40,13 @@ md("""## 1. Build the v2 dataset from GHSL temporal pairs (~30-60 min)
 One sample per town per consecutive epoch pair with observed growth.""")
 code("""import os
 os.makedirs("data", exist_ok=True)
-from towns import TRAIN_TOWNS
+from towns import TOWNS
 from data_v2 import build_dataset_v2
-n = build_dataset_v2(TRAIN_TOWNS, "data/dataset_v2.npz", cache_dir="data/ghsl_cache")
-print("v2 samples:", n)""")
+n = build_dataset_v2(TOWNS, "data/dataset_v2.npz", cache_dir="data/ghsl_cache",
+                     town_cache_dir="data/town_cache_v2")
+print("v2 samples:", n)
+# Resumable: if this cell is interrupted, just re-run it -- finished towns
+# reload from data/town_cache_v2 in milliseconds.""")
 
 md("""## 2. Train (~1.5 h on T4) — same model/trainer as v1, new data""")
 code("""!python src/train.py --data data/dataset_v2.npz --out runs/v2 --epochs 120 --batch 16""")
@@ -61,7 +64,7 @@ Sample 16 futures, rank with the 11-metric scorecard (real amenities,
 greenspace, flood/landslide proxies, congestion, access equity), show the
 top 3 with walk-time maps and bike-lane annotations.""")
 code("""import numpy as np, torch, matplotlib.pyplot as plt
-from towns import TEST_TOWNS
+from towns import EVAL_TOWNS
 from data import binary_dilate
 from data_v2 import sample_density, make_sample_v2, FOOTPRINT_THR
 from data import fetch_elevation, fetch_osm, rasterize_osm
@@ -69,7 +72,7 @@ from model import UNet, Diffusion
 import sustainability as sus
 from bikelanes import assign_bike_lanes
 
-name, lat, lon = TEST_TOWNS[0]
+name, cc, lat, lon, region = EVAL_TOWNS[0]
 elev = fetch_elevation(lat, lon)
 roads_now, _ = rasterize_osm(fetch_osm(lat, lon), lat, lon)
 d_now = sample_density(lat, lon, 2020, cache_dir="data/ghsl_cache")
