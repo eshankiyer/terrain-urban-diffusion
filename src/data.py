@@ -136,20 +136,25 @@ out geom;
 """
 
 
-def fetch_osm(lat, lon, session=None, sleep=1.0):
+def fetch_osm(lat, lon, session=None, sleep=1.0, rounds=2):
+    """Query Overpass with mirror rotation and a second retry round, so a
+    transient timeout doesn't silently drop a town from the dataset."""
     import requests
     session = session or requests.Session()
     s, w, n, e = window_bbox(lat, lon)
     q = QUERY.format(s=s, w=w, n=n, e=e)
     last_err = None
-    for url in OVERPASS_URLS:
-        try:
-            r = session.post(url, data={"data": q}, timeout=120)
-            r.raise_for_status()
-            time.sleep(sleep)  # be polite to the public API
-            return r.json()
-        except Exception as err:  # noqa: BLE001 - retry on any failure
-            last_err = err
+    for attempt in range(rounds):
+        for url in OVERPASS_URLS:
+            try:
+                r = session.post(url, data={"data": q}, timeout=120)
+                r.raise_for_status()
+                time.sleep(sleep)  # be polite to the public API
+                return r.json()
+            except Exception as err:  # noqa: BLE001 - retry on any failure
+                last_err = err
+        if attempt + 1 < rounds:
+            time.sleep(8.0)  # back off before the retry round
     raise RuntimeError(f"Overpass failed for {lat},{lon}: {last_err}")
 
 
@@ -248,34 +253,86 @@ def augment(cond, target, k, flip):
     return np.ascontiguousarray(c), np.ascontiguousarray(t)
 
 
-def build_dataset(towns, out_path, jitter=3, verbose=True):
-    """Download + rasterize every town, with augmentation. Saves an .npz."""
+def _town_windows(town, jitter, sess, overpass_sem=None):
+    """Fetch + rasterize the jittered windows for one town. The jitter rng
+    is seeded per town so results don't depend on completion order."""
+    name, cc, lat, lon, region = town
+    rng = np.random.default_rng(abs(hash((name, cc))) % (2 ** 32))
+    centres = [(lat, lon)] + [
+        (lat + rng.uniform(-2e-3, 2e-3), lon + rng.uniform(-2e-3, 2e-3))
+        for _ in range(jitter)]
+    samples = []
+    for la, lo in centres:
+        elev = fetch_elevation(la, lo, sess)
+        if overpass_sem is None:
+            osm = fetch_osm(la, lo, sess)
+        else:
+            with overpass_sem:
+                osm = fetch_osm(la, lo, sess, sleep=0.3)
+        roads, built = rasterize_osm(osm, la, lo)
+        s = make_sample(elev, roads, built)
+        if s is not None:
+            samples.append(s)
+    return samples
+
+
+def build_dataset(towns, out_path, jitter=3, verbose=True, workers=4,
+                  cache_dir="data/town_cache"):
+    """Download + rasterize every town, with augmentation. Saves an .npz.
+
+    Resumable: each town's raw windows are cached in `cache_dir` as soon as
+    they are fetched, so an interrupted or re-run build skips finished towns
+    in milliseconds instead of refetching everything.
+    Parallel: towns are fetched by a small thread pool (the work is network
+    bound), with Overpass capped at 2 concurrent requests to stay polite."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     import requests
-    sess = requests.Session()
-    sess.headers["User-Agent"] = "terrain-urban-diffusion research (contact: repo issues)"
+
+    os.makedirs(cache_dir, exist_ok=True)
+    overpass_sem = threading.Semaphore(2)
+    n_cond = 4  # conditioning channels per sample
+
+    def worker(town):
+        name, cc, _, _, _ = town
+        safe = f"{name}_{cc}".replace(" ", "_").replace("/", "_")
+        cache = os.path.join(cache_dir, safe + ".npz")
+        if os.path.exists(cache):
+            d = np.load(cache, allow_pickle=True)
+            return list(zip(d["cond"], d["target"])), True
+        sess = requests.Session()
+        sess.headers["User-Agent"] = ("terrain-urban-diffusion research "
+                                      "(contact: repo issues)")
+        samples = _town_windows(town, jitter, sess, overpass_sem)
+        cond = (np.stack([c for c, _ in samples]) if samples
+                else np.zeros((0, n_cond, GRID, GRID), np.float32))
+        target = (np.stack([t for _, t in samples]) if samples
+                  else np.zeros((0, 2, GRID, GRID), np.float32))
+        np.savez_compressed(cache, cond=cond, target=target)
+        return samples, False
+
     conds, targets, meta = [], [], []
-    rng = np.random.default_rng(0)
-    for name, cc, lat, lon, region in towns:
-        try:
-            centres = [(lat, lon)] + [
-                (lat + rng.uniform(-2e-3, 2e-3), lon + rng.uniform(-2e-3, 2e-3))
-                for _ in range(jitter)]
-            for la, lo in centres:
-                elev = fetch_elevation(la, lo, sess)
-                osm = fetch_osm(la, lo, sess)
-                roads, built = rasterize_osm(osm, la, lo)
-                s = make_sample(elev, roads, built)
-                if s is None:
-                    continue
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(worker, t): t for t in towns}
+        for fut in as_completed(futures):
+            name, cc, _, _, region = futures[fut]
+            done += 1
+            try:
+                samples, cached = fut.result()
+            except Exception as err:  # noqa: BLE001 - skip towns that fail
+                print(f"[data] SKIP {name}: {err}")
+                continue
+            for c0, t0 in samples:
                 for k in range(4):
                     for flip in (False, True):
-                        c, t = augment(*s, k, flip)
+                        c, t = augment(c0, t0, k, flip)
                         conds.append(c); targets.append(t)
                         meta.append((name, cc, region))
             if verbose:
-                print(f"[data] {name}, {cc}: total samples so far {len(conds)}")
-        except Exception as err:  # noqa: BLE001 - skip towns that fail
-            print(f"[data] SKIP {name}: {err}")
+                tag = "cached" if cached else "fetched"
+                print(f"[data] {done}/{len(towns)} {name}, {cc} ({tag}): "
+                      f"total samples {len(conds)}")
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     np.savez_compressed(out_path,
                         cond=np.stack(conds), target=np.stack(targets),
