@@ -26,8 +26,8 @@ Expansion Layouts of Small Towns}
 Generative models for urban layouts have concentrated on large,
 grid-dominated cities, typically in the United States, and almost
 universally ignore the terrain the city sits on. Yet for the small towns
-that make up most settlements worldwide---and especially for towns in
-hilly regions of Europe and Asia---topography is a first-order constraint
+that make up most settlements worldwide, and especially for towns in
+hilly regions of Europe and Asia, topography is a first-order constraint
 on where streets and buildings can go. We present a conditional denoising
 diffusion model that generates street-level expansion layouts (road
 rasters and continuous built-up density) for small towns, conditioned
@@ -40,9 +40,9 @@ temporal supervision: each sample conditions on the town as observed at
 one epoch and targets the next. A concentric-erosion proxy that
 manufactures pseudo-temporal pairs from a single snapshot, used in an
 earlier version of this work, is retained as a baseline. An
-eleven-metric raster scorecard---covering 15-minute amenity access,
-infill, land efficiency, hazard avoidance, green preservation, and
-access equity---turns the sampler into an optimizer by best-of-$N$
+eleven-metric raster scorecard (15-minute amenity access, infill, land
+efficiency, hazard avoidance, green preservation, access equity, and
+related measures) turns the sampler into an optimizer by best-of-$N$
 selection, and post-hoc classifiers annotate selected plans with bike
 infrastructure and typed zones. Training converges from 0.744 to
 approximately 0.04 noise-prediction loss over 120 epochs; we show
