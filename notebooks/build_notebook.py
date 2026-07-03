@@ -37,7 +37,7 @@ from sample import load_model, expand_once
 d = np.load("data/smoke.npz", allow_pickle=True)
 diff = load_model("runs/smoke/ckpt.pt", "cuda")
 c = d["cond"][0]
-r, b, raw = expand_once(diff, c[0]*300, c[2], c[3], steps=10, seed=0)
+r, b, raw = expand_once(diff, c[0]*300, c[3], c[4], water=c[2], steps=10, seed=0)
 print("SMOKE OK — sample shape", raw.shape, "road px", int(r.sum()), "built px", int(b.sum()))""")
 
 md("## 1. Build datasets (downloads OSM + terrain; ~30–50 min)")
@@ -84,7 +84,7 @@ for i,(r,b) in enumerate(stages):  pack[f"sb_r{i}"], pack[f"sb_b{i}"] = r, b
 for i,(r,b) in enumerate(stages2): pack[f"s2_r{i}"], pack[f"s2_b{i}"] = r, b
 for name, res in cases.items():
     key = name.replace(" ", "_")[:12]
-    for f in ("elev","core_built","core_roads","real_roads","real_built","gen_roads","gen_built"):
+    for f in ("elev","water","core_built","core_roads","real_roads","real_built","gen_roads","gen_built"):
         pack[f"case_{key}_{f}"] = res[f]
 buf = io.BytesIO(); np.savez_compressed(buf, **pack); raw = buf.getvalue()
 b64 = base64.b64encode(raw).decode()
