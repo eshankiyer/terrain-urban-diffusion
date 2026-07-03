@@ -31,6 +31,27 @@ module: service centres are proxied by density peaks until an amenity
 channel exists, and the score measures spatial form, not certified
 environmental performance.
 
+`environment.py` and the extended `scorecard_v2` close the gaps the first
+scorecard proxied or skipped. The module fetches real OSM amenities in seven
+categories (food, education, health, civic, recreation, transit, social),
+greenspace and water masks, and derives two terrain hazard proxies: a HAND
+flood mask (height above nearest water under 5 m within about 105 m of
+mapped water) and slope-threshold landslide masks (25 and 35 degrees, severe
+counted double). The 11-metric scorecard replaces density-peak service
+centres with real fixed amenities, adds green preservation measured against
+baseline functional patches of at least 0.45 ha, network-walk green access
+within 300 m, flood and landslide avoidance over new development only,
+a congestion proxy (1 minus the Gini of edge betweenness on the road graph),
+and spatial access equity (population-weighted CV of per-cell amenity
+coverage). Ranking applies a delivery factor so a do-nothing plan cannot
+win best-of-N by avoiding every hazard. The design came from a STORM-style
+multi-perspective spec (ecologist, transport engineer, geotechnical
+engineer, equity planner) and the implementation survived two rounds of an
+adversarial prover-verifier loop, which caught one critical defect
+(pre-existing roads scored as new development) and three bugs before
+acceptance. Income, tenure, affordability and displacement risk are named
+human inputs, deliberately not fabricated from rasters.
+
 `bikelanes.py` keeps bike infrastructure out of the diffusion model (OSM
 cycleway tags are near-absent in the training towns) and instead trains a
 per-edge logistic classifier on twelve well-tagged flat European towns, using
