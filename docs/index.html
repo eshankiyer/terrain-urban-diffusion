@@ -874,22 +874,35 @@ async function paintReal() {
     const foot = new Float64Array(n);
     for (let i = 0; i < n; i++) foot[i] = (osm.built[i] || osm.roads[i]) ? 1 : 0;
     const near = boxBlur(foot, 8);
-    // SELF-CALIBRATING interior cutoff: a fixed density number doesn't
-    // generalize across towns with very different OSM tagging completeness.
-    // Measured against real Vaduz data, mapped building+road pixels cover
-    // only ~17% of the window even at its historic core (r=8 p90 is ~0.40),
-    // so a flat 0.45 cutoff excluded almost nothing (~6-10% of the window)
-    // and the fix was a no-op in practice. Use the window's own mean local
-    // density instead: denser-than-average = interior fabric, everything
-    // below the town's own average = fringe/eligible. Self-adjusts per town.
+    // SELF-CALIBRATING thresholds: a fixed density number doesn't
+    // generalize across towns with very different OSM tagging completeness
+    // and street-grid tightness. Measured live against real Vaduz data
+    // (fetched + run through the actual deployed model, not guessed):
+    //   - a flat 0.45 cutoff excluded ~6-10% of the window (near no-op)
+    //   - the window's raw mean (nearMean, ~0.17 for Vaduz) excluded so
+    //     much that the solid-growth layer went to 0% -- Vaduz's model
+    //     output is already low almost everywhere (dNew>0.25 on only
+    //     ~11% of the window pre-gating), so "denser than average" ate
+    //     the whole thing.
+    //   - interiorThr = nearMean*2.5 keeps a small (2-4%), non-zero solid
+    //     patch: only the genuinely dense core gets excluded.
+    //   - the advisory ring previously used `near>1e-9` (i.e. "within
+    //     250 m of literally any road/building pixel"), which covers
+    //     ~77% of Vaduz's window because its street grid is dense
+    //     everywhere -- that's why "faint advisory" visually swallowed
+    //     almost the whole map. floorThr adds a lower bound so the ring
+    //     is a genuine band next to existing fabric, not "anywhere
+    //     touched by a nearby street." Together these took Vaduz's
+    //     advisory area from ~77-97% of the window down to ~35%.
     let nearMean = 0;
     for (let i = 0; i < n; i++) nearMean += near[i];
     nearMean = Math.max(0.05, nearMean / n);
+    const interiorThr = nearMean * 2.5, floorThr = nearMean * 0.25;
     const dNew = new Float32Array(n), rawMask = new Uint8Array(n);
     for (let i = 0; i < n; i++) {
       dNew[i] = Math.max(0, Math.min(1, (x[n+i]+1)/2));
       if (dNew[i] > 0.25 && !osm.built[i] && !osm.roads[i] && !osm.water[i]
-          && !steep[i] && near[i] < nearMean) rawMask[i] = 1;
+          && !steep[i] && near[i] < interiorThr) rawMask[i] = 1;
     }
     // despeckle: drop 8-connected components < 4 px (mirrors data.built_mask)
     const mask = dropSmallComponents(rawMask, 4);
@@ -929,7 +942,8 @@ async function paintReal() {
     if (zones) {
       const cand = new Uint8Array(n);
       for (let i = 0; i < n; i++)
-        if (near[i] > 1e-9 && !foot[i] && !osm.water[i] && !steep[i] && !mask[i])
+        if (near[i] > floorThr && near[i] < interiorThr && !foot[i]
+            && !osm.water[i] && !steep[i] && !mask[i])
           cand[i] = 1;
       const densCtx = new Float64Array(n);    // context = existing town + proposal
       for (let i = 0; i < n; i++)
