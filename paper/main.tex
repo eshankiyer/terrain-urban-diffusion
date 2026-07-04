@@ -747,6 +747,35 @@ that drops built-mask components below a small pixel-count threshold,
 so a real parcel and a single noisy pixel are no longer treated the
 same way by one stage and differently by the other.
 
+\subsection{Advisory zoning for expansion land}
+\label{sec:advisory}
+Until this point the zone classifier only touched pixels the diffusion
+model had already committed to: sample growth first, label it second.
+That ordering buries the most useful planning question. A planner
+deciding where a town should expand wants a recommended use for land
+before anything is built on it, not a label on a finished proposal.
+
+v4 adds this as a second, explicitly advisory pass. The candidate set
+is the undeveloped ring within roughly 120 m of the current footprint,
+minus roads, water, steep slopes, and any protected mask. Each
+candidate pixel is typed with the same six features and the same
+classifier used for generated growth, with local density context taken
+from the existing town rather than from a sample. Pixels below the
+abstention margin stay untyped. On the map the advisory layer is drawn
+faint while sampled growth stays solid, so a proposal and a
+recommendation cannot be mistaken for one another.
+
+The two layers answer different questions. The generated density says
+where growth is likely, given forty years of observed change on
+similar terrain. The advisory layer says what use fits a parcel if it
+develops. Where they agree, the planner gets a concrete suggestion:
+this fringe develops in most sampled futures, and its context reads as
+low-density residential with commercial frontage along the arterial.
+Where they disagree, the disagreement is itself information. The layer
+inherits every limitation of the classifier it wraps, including the
+0.30 macro-F1, which is why it abstains rather than guesses and is
+presented as advice, not analysis.
+
 \subsection{Browser deployment}
 \label{sec:v4browser}
 The diffusion model and the zone classifier both now run client-side.
