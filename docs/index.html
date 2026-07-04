@@ -301,7 +301,7 @@ let session = null, modelMissing = false;
 async function getSession() {
   if (session || modelMissing) return session;
   try {
-    statusEl.textContent = "loading model weights (~50 MB, first time only)…";
+    statusEl.textContent = "loading model weights (~23 MB, first time only)…";
     session = await ort.InferenceSession.create("model/model.onnx",
       { executionProviders: ["wasm"] });
   } catch (e) {
@@ -329,7 +329,8 @@ async function generate() {
     const n = G*G;
     const newRoads = new Uint8Array(n), newDens = new Float32Array(n), amen = new Float32Array(n);
     for (let i=0;i<n;i++) {
-      newRoads[i] = x[i] > 0 ? 1 : 0;
+      /* roads channel is not reliable at this dataset size; display skips it */
+      newRoads[i] = 0;
       newDens[i]  = Math.max(0, Math.min(1, (x[n+i]+1)/2));
       amen[i]     = Math.max(0, Math.min(1, (x[2*n+i]+1)/2));
     }
@@ -351,7 +352,7 @@ function renderOut(elev, roads, built, gen, amen) {
     const sl=Math.atan(Math.hypot(gx,gy)), asp=Math.atan2(-gx,gy);
     const sh=(Math.sin(0.785)*Math.cos(sl)+Math.cos(0.785)*Math.sin(sl)*Math.cos(5.5-asp)+1)/2;
     let r=200+sh*45, g=198+sh*45, b=188+sh*45;
-    if (gen && gen.newDens[i] > 0.12 && !built[i]) { r=242; g=182; b=96; }
+    if (gen && gen.newDens[i] > 0.25 && !built[i]) { r=242; g=182; b=96; }
     if (built[i]) { r=g=b=120; }
     if (roads[i] || (gen && gen.newRoads[i])) { r=g=b=32; }
     img.data[4*i]=r; img.data[4*i+1]=g; img.data[4*i+2]=b; img.data[4*i+3]=255;
@@ -504,13 +505,11 @@ growBtn.onclick = async () => {
       for (let i = 0; i < n; i++) {
         const dNew = Math.max(0, Math.min(1, (x[n+i]+1)/2));
         if (osm.built[i] && !osm.roads[i]) cell(i, "rgba(120,120,120,0.55)");
-        else if (dNew > 0.12 && !osm.roads[i]) cell(i, "rgba(242,182,96,0.72)");
+        else if (dNew > 0.25 && !osm.roads[i]) cell(i, "rgba(242,182,96,0.78)");
       }
       for (let i = 0; i < n; i++)
-        if (x[i] > 0 && !osm.roads[i]) cell(i, "rgba(208,95,78,0.88)", 1);
-      for (let i = 0; i < n; i++)
         if (osm.roads[i]) cell(i, "rgba(20,20,20,0.72)", 1);
-      statusReal.textContent = "done. orange is generated growth, red-brown is new roads";
+      statusReal.textContent = "done. orange is where the model adds growth";
     }
     const ov = L.imageOverlay(cnv.toDataURL(), bounds,
       { opacity: 0.9, className: "crisp" }).addTo(map);
