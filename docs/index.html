@@ -92,10 +92,14 @@ research pipeline uses real elevation.</p>
     <div class="legend">
       <span style="background:#8a8a8a"></span>your plan
       <span style="background:#78b46e"></span>kept free (locked)
-      <span style="background:#f2d16b"></span>residential
+      <span style="background:#f7e3a1"></span>res low
+      <span style="background:#f2d16b"></span>res med
+      <span style="background:#d9b13b"></span>res high
       <span style="background:#e0655f"></span>commercial
       <span style="background:#a58bc4"></span>industrial
       <span style="background:#6fa8dc"></span>institutional
+      <span style="background:#e08f3c"></span>mixed use
+      <span style="background:#f2b660"></span>orange = untyped growth
       <span style="background:#222"></span>roads
       <span style="background:#d62828"></span>★ proposed local centres
     </div>
@@ -117,10 +121,15 @@ the training data best; megacities will confuse it.</p>
 <div id="status-real" class="legend" style="min-height:1.4em"></div>
 <div class="legend" style="margin-top:4px">
   <span style="background:#8a8a8a"></span>existing town
-  <span style="background:#f2d16b"></span>residential
+  <span style="background:#f7e3a1"></span>res low
+  <span style="background:#f2d16b"></span>res med
+  <span style="background:#d9b13b"></span>res high
   <span style="background:#e0655f"></span>commercial
   <span style="background:#a58bc4"></span>industrial
   <span style="background:#6fa8dc"></span>institutional
+  <span style="background:#e08f3c"></span>mixed use
+  <span style="background:#f2b660"></span>orange = untyped growth
+  <span style="background:rgba(90,140,200,0.7)"></span>water (locked)
   <span style="background:#d62828"></span>★ proposed local centres
 </div>
 <div class="toolbar" style="margin-top:8px">
@@ -158,6 +167,13 @@ or planning advice · MIT-style, see repo</footer>
 <script>
 "use strict";
 const G = 128, T_STEPS = 1000, OUT_CH = 3, STEPS = 24;
+// COND_CH: channels the DEPLOYED zone_clf/model.onnx expect. The v4 dataset
+// (src/data_v3.py) builds 5-channel conds (+ filled water mask, channel 4),
+// but the weights currently published on this site are still the 4-channel
+// build. TODO(v5 deploy): once the 5-ch expert models ship, bump this to 5
+// and append the water channel in condFrom() -- DO NOT add it before then,
+// it would silently mismatch the deployed ONNX graph's input shape.
+const COND_CH = 4;
 const dc = document.getElementById("draw"), dx = dc.getContext("2d");
 const oc = document.getElementById("out"), ox = oc.getContext("2d");
 const statusEl = document.getElementById("status");
@@ -274,7 +290,7 @@ function condFrom(roads, built, elev) {
     }
     foot[y*G+x]=hit;
   }
-  const cond = new Float32Array(4*n);
+  const cond = new Float32Array(COND_CH*n);
   for (let i=0;i<n;i++) {
     cond[i]       = Math.max(-3,Math.min(3,(elev[i]-mean)/sd))/3;
     cond[n+i]     = Math.min(1, Math.max(0, slope[i]/30));
@@ -286,8 +302,10 @@ function condFrom(roads, built, elev) {
 
 /* ---------- zone typing + steering: pure helpers ---------- */
 /*PURE*/
-const ZONE_NAMES = {1:"residential",2:"commercial",3:"industrial",4:"institutional"};
-const ZONE_RGB = {1:[242,209,107],2:[224,101,95],3:[165,139,196],4:[111,168,220]};
+const ZONE_NAMES = {1:"residential",2:"commercial",3:"industrial",4:"institutional",5:"mixed"};
+// Class 5 ("mixed use") won't fire until the retrained zone_clf.json ships
+// (deployed weights only know classes 1-4) -- colour is wired up ready for it.
+const ZONE_RGB = {1:[242,209,107],2:[224,101,95],3:[165,139,196],4:[111,168,220],5:[224,143,60]};
 function boxBlur(src, r, w, h) {   // replicate-edge box blur (ports data_v3._box_blur)
   w=w||G; h=h||G;
   if (r<=0) return Float64Array.from(src);
@@ -425,18 +443,27 @@ async function getZoneClf() {      // lazy; graceful fallback to plain orange on
   }
   return zoneClf;
 }
+/* ABSTAIN: margin = top raw score minus runner-up (same idea as
+   zones.predict_with_margin); context = local built density, box-blurred
+   r=4 (feature f3, already computed by zoneFeatureFields). Caller decides
+   the threshold so plain-orange "untyped growth" painting stays here in
+   one place instead of duplicated per call site. Returns the per-pixel
+   class (0 where mask is 0), plus margin/context so callers can abstain. */
 function classifyGrowth(clf, elev, roads, dens, amen, mask, biases) {
   const F=zoneFeatureFields(elev,roads,dens,amen), n=G*G;
   const out=new Uint8Array(n), xv=new Float64Array(6);
+  const margin=new Float64Array(n), context=F[3];
   for (let i=0;i<n;i++) {
     if (!mask[i]) continue;
     for (let k=0;k<6;k++) xv[k]=F[k][i];
     const s=gbtScores(clf,xv);
     if (biases) for (const b of biases) if (b.mask[i]) s[b.ci]*=(1+b.w);
     let bc=0; for (let c=1;c<s.length;c++) if (s[c]>s[bc]) bc=c;
+    let rc=-1; for (let c=0;c<s.length;c++) if (c!==bc && (rc<0 || s[c]>s[rc])) rc=c;
+    margin[i]=rc<0 ? s[bc] : s[bc]-s[rc];
     out[i]=clf.classes[bc];
   }
-  return out;
+  return { zones: out, margin, context };
 }
 
 /* ---------- DDIM sampling with onnxruntime-web ---------- */
@@ -460,7 +487,7 @@ async function runDDIM(sess, cond, statusNode, keepMask, xKnown) {
   const rng = mulberry32(1234); gaussSpare = null;
   let x = new Float32Array(OUT_CH*n);
   for (let i=0;i<x.length;i++) x[i]=gauss(rng);
-  const condT = new ort.Tensor("float32", cond, [1,4,G,G]);
+  const condT = new ort.Tensor("float32", cond, [1,COND_CH,G,G]);
   const ts = [];
   for (let i=0;i<STEPS;i++) ts.push(Math.round((T_STEPS-1)*(1-i/(STEPS-1))));
   for (let i=0;i<STEPS;i++) {
@@ -540,16 +567,16 @@ async function generate() {
       amen[i]     = Math.max(0, Math.min(1, (x[2*n+i]+1)/2));
     }
     const clf = await getZoneClf();
-    let zones = null;
+    let cg = null;
     if (clf) {
       const mask = new Uint8Array(n);
       for (let i=0;i<n;i++)
         if (newDens[i]>0.25 && !built[i] && !roads[i] && !parks[i]) mask[i]=1;
-      zones = classifyGrowth(clf, elev, roads, newDens, sparseAmen(amen), mask, null);
+      cg = classifyGrowth(clf, elev, roads, newDens, sparseAmen(amen), mask, null);
     }
-    renderOut(elev, roads, built, parks, {newRoads, newDens}, amen, zones);
-    statusEl.textContent = (zones
-      ? "done. growth typed by use: yellow residential, red commercial, purple industrial, blue institutional"
+    renderOut(elev, roads, built, parks, {newRoads, newDens}, amen, cg);
+    statusEl.textContent = (cg
+      ? "done. growth typed by use: yellow residential, red commercial, purple industrial, blue institutional, orange mixed use (orange = untyped growth)"
       : "done. grey is your plan, orange is the model's growth")
       + (lockN ? ` · ${lockN} px locked to your plan` : "");
   } catch (err) {
@@ -559,7 +586,8 @@ async function generate() {
 document.getElementById("go").onclick = generate;
 
 /* ---------- output rendering ---------- */
-function renderOut(elev, roads, built, parks, gen, amen, zones) {
+const RES_TIER_RGB = [[247,227,161], [242,209,107], [217,177,59]]; // low/med/high
+function renderOut(elev, roads, built, parks, gen, amen, cg) {
   const img = ox.createImageData(G, G), n = G*G;
   const at=(y,x)=>elev[Math.max(0,Math.min(G-1,y))*G+Math.max(0,Math.min(G-1,x))];
   for (let y=0;y<G;y++) for (let x=0;x<G;x++) {
@@ -569,9 +597,14 @@ function renderOut(elev, roads, built, parks, gen, amen, zones) {
     const sh=(Math.sin(0.785)*Math.cos(sl)+Math.cos(0.785)*Math.sin(sl)*Math.cos(5.5-asp)+1)/2;
     let r=200+sh*45, g=198+sh*45, b=188+sh*45;
     if (gen && gen.newDens[i] > 0.25 && !built[i]) {
-      const z = zones ? zones[i] : 0;
-      if (z) { const c=ZONE_RGB[z]; r=c[0]; g=c[1]; b=c[2]; }
-      else { r=242; g=182; b=96; }
+      // ABSTAIN: only trust a typed colour when margin/context clear the bar
+      const z = (cg && cg.zones[i] && cg.margin[i] > 0.5 && cg.context[i] > 0.02)
+        ? cg.zones[i] : 0;
+      if (z === 1) {
+        const t = gen.newDens[i] > 0.6 ? 2 : gen.newDens[i] > 0.35 ? 1 : 0;
+        const c = RES_TIER_RGB[t]; r=c[0]; g=c[1]; b=c[2];
+      } else if (z) { const c=ZONE_RGB[z]; r=c[0]; g=c[1]; b=c[2]; }
+      else { r=242; g=182; b=96; }              // orange = untyped growth
     }
     if (parks && parks[i]) { r=120; g=180; b=110; }
     if (built[i]) { r=g=b=120; }
@@ -664,17 +697,26 @@ const AMEN_SET = new Set(AMEN_TAGS.split("|"));
 async function fetchOSMReal(lat, lon) {
   const b = windowBounds(lat, lon);
   const bb = `${b[0][0]},${b[0][1]},${b[1][0]},${b[1][1]}`;
+  // WATER LOCK: lakes/wetland/riverbank/dock ways, so the sampler never
+  // builds on flat water (it used to read like buildable valley floor).
   const q = `[out:json][timeout:60];(way(${bb})` +
     `["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|unclassified|living_street|service)"];` +
     `way(${bb})["building"];` +
     `node(${bb})["amenity"~"^(${AMEN_TAGS})$"];node(${bb})["shop"];` +
-    `way(${bb})["amenity"~"^(${AMEN_TAGS})$"];way(${bb})["shop"];);out geom;`;
+    `way(${bb})["amenity"~"^(${AMEN_TAGS})$"];way(${bb})["shop"];` +
+    `way(${bb})["natural"~"^(water|wetland)$"];` +
+    `way(${bb})["waterway"~"^(riverbank|dock)$"];);out geom;`;
   const r = await fetch("https://overpass-api.de/api/interpreter",
     { method: "POST", body: "data=" + encodeURIComponent(q) });
   const js = await r.json();
   const cnv = document.createElement("canvas"); cnv.width = G; cnv.height = G;
   const ctx = cnv.getContext("2d");
   ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, G, G);
+  // Second offscreen canvas, filled pure blue for water only, so reading
+  // it back can't be confused with building/road colours on the main one.
+  const wcnv = document.createElement("canvas"); wcnv.width = G; wcnv.height = G;
+  const wctx = wcnv.getContext("2d");
+  wctx.fillStyle = "#000"; wctx.fillRect(0, 0, G, G);
   const [s, w] = b[0], [nn, e] = b[1];
   const toPx = (g) => [ (g.lon - w) / (e - w) * (G - 1),
                         (nn - g.lat) / (nn - s) * (G - 1) ];
@@ -689,6 +731,15 @@ async function fetchOSMReal(lat, lon) {
     const poi = ("shop" in t) || AMEN_SET.has(t.amenity);
     if (el.type === "node") { if (poi) addPt(el.lat, el.lon); continue; }
     if (el.type !== "way" || !el.geometry) continue;
+    const isWater = /^(water|wetland)$/.test(t.natural || "") ||
+                    /^(riverbank|dock)$/.test(t.waterway || "");
+    if (isWater) {
+      const pts = el.geometry.map(toPx);
+      wctx.beginPath();
+      pts.forEach((p, i) => i ? wctx.lineTo(p[0], p[1]) : wctx.moveTo(p[0], p[1]));
+      wctx.closePath(); wctx.fillStyle = "#00f"; wctx.fill();
+      continue;               // water ways never draw as buildings/roads
+    }
     if (poi) {                              // way POI: centroid
       let sa = 0, so = 0;
       for (const g of el.geometry) { sa += g.lat; so += g.lon; }
@@ -707,12 +758,15 @@ async function fetchOSMReal(lat, lon) {
     }
   }
   const d = ctx.getImageData(0, 0, G, G).data;
-  const roads = new Uint8Array(G * G), built = new Uint8Array(G * G);
+  const wd = wctx.getImageData(0, 0, G, G).data;
+  const roads = new Uint8Array(G * G), built = new Uint8Array(G * G),
+        water = new Uint8Array(G * G);
   for (let i = 0; i < G * G; i++) {
     const r0 = d[4*i], g0 = d[4*i+1], b0 = d[4*i+2];
     const lum = (r0*299 + g0*587 + b0*114) / 1000;
     if (lum < 70) roads[i] = 1;
     else if (r0 > g0 && Math.max(r0,g0,b0)-Math.min(r0,g0,b0) > 60) built[i] = 1;
+    if (wd[4*i+2] > 128 && wd[4*i] < 64 && wd[4*i+1] < 64) water[i] = 1;
   }
   /* real amenity density, exactly like data_v3.amenity_density:
      counts -> box blur r=4 -> log1p -> normalize to max 1 */
@@ -723,7 +777,7 @@ async function fetchOSMReal(lat, lon) {
     if (amenReal[i] > mx) mx = amenReal[i];
   }
   if (mx > 0) for (let i = 0; i < G * G; i++) amenReal[i] /= mx;
-  return { roads, built, amenReal };
+  return { roads, built, water, amenReal };
 }
 
 let lastReal = null;   // {x, osm, elev, cond, bounds, amen, biases} from last grow
@@ -747,30 +801,46 @@ async function paintReal() {
   let typed = false;
   if (!x) {
     for (let i = 0; i < n; i++)
-      if (osm.built[i] && !osm.roads[i]) cell(i, "rgba(120,120,120,0.62)");
+      if (osm.built[i] && !osm.roads[i] && !osm.water[i]) cell(i, "rgba(120,120,120,0.62)");
   } else {
     const dNew = new Float32Array(n), mask = new Uint8Array(n);
     for (let i = 0; i < n; i++) {
       dNew[i] = Math.max(0, Math.min(1, (x[n+i]+1)/2));
-      if (dNew[i] > 0.25 && !osm.built[i] && !osm.roads[i]) mask[i] = 1;
+      if (dNew[i] > 0.25 && !osm.built[i] && !osm.roads[i] && !osm.water[i]) mask[i] = 1;
     }
     const clf = await getZoneClf();
     /* roads feature: model roads are hidden as unreliable, so zoning sees
        only the existing OSM network (pipeline uses existing+generated) */
-    const zones = clf
+    const { zones, margin, context } = clf
       ? classifyGrowth(clf, elev, osm.roads, dNew,
-                       osm.amenReal || sparseAmen(amen), mask, biases) : null;
+                       osm.amenReal || sparseAmen(amen), mask, biases)
+      : { zones: null };
     typed = !!zones;
     const zc = {1:"rgba(242,209,107,0.8)", 2:"rgba(224,101,95,0.8)",
-                3:"rgba(165,139,196,0.8)", 4:"rgba(111,168,220,0.8)"};
+                3:"rgba(165,139,196,0.8)", 4:"rgba(111,168,220,0.8)",
+                5:"rgba(224,143,60,0.8)"};
+    // residential density tiers (display-only, decoded from dNew)
+    const resTier = (v) => v > 0.6 ? "rgba(217,177,59,0.85)"
+                          : v > 0.35 ? "rgba(242,209,107,0.8)"
+                          : "rgba(247,227,161,0.75)";
     for (let i = 0; i < n; i++) {
+      if (osm.water[i]) continue;              // never paint on water
       if (osm.built[i] && !osm.roads[i]) cell(i, "rgba(120,120,120,0.55)");
-      else if (mask[i])
-        cell(i, zones && zones[i] ? zc[zones[i]] : "rgba(242,182,96,0.78)");
+      else if (mask[i]) {
+        // ABSTAIN: below the margin/context threshold, stay plain orange
+        // growth instead of a (probably unreliable) typed zone colour.
+        const z = zones && zones[i] && margin[i] > 0.5 && context[i] > 0.02
+          ? zones[i] : 0;
+        if (z === 1) cell(i, resTier(dNew[i]));
+        else if (z) cell(i, zc[z]);
+        else cell(i, "rgba(242,182,96,0.78)");  // orange = untyped growth
+      }
     }
   }
   for (let i = 0; i < n; i++)
-    if (osm.roads[i]) cell(i, "rgba(20,20,20,0.72)", 1);
+    if (osm.water[i]) cell(i, "rgba(90,140,200,0.35)");
+  for (let i = 0; i < n; i++)
+    if (osm.roads[i] && !osm.water[i]) cell(i, "rgba(20,20,20,0.72)", 1);
   overlays.push(L.imageOverlay(cnv.toDataURL(), bounds,
     { opacity: 0.9, className: "crisp" }).addTo(map));
   if (amen) {                                  // proposed local centres
@@ -794,9 +864,13 @@ growBtn.onclick = async () => {
     const [elev, osm] = await Promise.all([
       fetchElevReal(pick.lat, pick.lng), fetchOSMReal(pick.lat, pick.lng)]);
     const n = G*G;
-    let anchor = 0;
-    for (let i = 0; i < n; i++) if (osm.built[i] || osm.roads[i]) anchor++;
+    let anchor = 0, waterN = 0;
+    for (let i = 0; i < n; i++) {
+      if (osm.built[i] || osm.roads[i]) anchor++;
+      if (osm.water[i]) waterN++;
+    }
     const sparse = anchor < 0.005 * n;
+    const mostlyWater = waterN > 0.6 * n;
     if (sparse)
       statusReal.textContent = "this window has almost no existing town to " +
         "anchor on — the model extrapolates poorly here; try clicking on a small town";
@@ -805,7 +879,12 @@ growBtn.onclick = async () => {
     const bounds = windowBounds(pick.lat, pick.lng);
     let x = null, amen = null;
     if (sess) {
-      x = await runDDIM(sess, cond, statusReal);
+      // WATER LOCK: lock the sampler to no-growth (-1, every channel) on
+      // water pixels so it cannot build on lakes/rivers, RePaint-style.
+      const keep = Float32Array.from(osm.water);
+      const anyWater = waterN > 0;
+      const xK = anyWater ? new Float32Array(OUT_CH*n).fill(-1) : null;
+      x = await runDDIM(sess, cond, statusReal, anyWater ? keep : null, xK);
       amen = new Float32Array(n);
       for (let i = 0; i < n; i++)
         amen[i] = Math.max(0, Math.min(1, (x[2*n+i]+1)/2));
@@ -814,9 +893,10 @@ growBtn.onclick = async () => {
     const typed = await paintReal();
     statusReal.textContent =
       (!x ? "no model weights yet: overlay shows the parsed existing town"
-        : typed ? "done. growth typed by use: yellow residential, red commercial, purple industrial, blue institutional"
+        : typed ? "done. growth typed by use: yellow residential, red commercial, purple industrial, blue institutional (orange = untyped growth)"
         : "done. orange is where the model adds growth")
-      + (sparse ? " · warning: almost no existing town in this window" : "");
+      + (sparse ? " · warning: almost no existing town in this window" : "")
+      + (mostlyWater ? " · warning: most of this window is water" : "");
     map.fitBounds(bounds);
   } catch (err) {
     statusReal.textContent = "error: " + err.message;
