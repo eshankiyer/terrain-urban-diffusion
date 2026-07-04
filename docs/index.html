@@ -959,9 +959,25 @@ async function fetchOSMReal(lat, lon) {
                     /^(riverbank|dock)$/.test(t.waterway || "");
     if (isWater) {
       const pts = el.geometry.map(toPx);
+      const geom = el.geometry;
+      // Only treat a way as a genuinely closed ring (lake/pond) if its
+      // first and last nodes coincide. OSM riverbank/waterway ways are
+      // almost always split into many long, OPEN segments tracing one
+      // bank of a winding river -- naively closePath()+fill()'ing those
+      // draws a straight chord across the whole meander and floods a
+      // wildly oversized area (much bigger than the real water). Stroke
+      // open segments at a fixed channel width instead.
+      const closed = geom.length > 2 &&
+        Math.abs(geom[0].lat - geom[geom.length - 1].lat) < 1e-5 &&
+        Math.abs(geom[0].lon - geom[geom.length - 1].lon) < 1e-5;
       wctx.beginPath();
       pts.forEach((p, i) => i ? wctx.lineTo(p[0], p[1]) : wctx.moveTo(p[0], p[1]));
-      wctx.closePath(); wctx.fillStyle = "#00f"; wctx.fill();
+      if (closed) {
+        wctx.closePath(); wctx.fillStyle = "#00f"; wctx.fill();
+      } else {
+        wctx.strokeStyle = "#00f"; wctx.lineWidth = 3; wctx.lineCap = "round";
+        wctx.lineJoin = "round"; wctx.stroke();
+      }
       continue;               // water ways never draw as buildings/roads
     }
     if (poi) {                              // way POI: centroid
