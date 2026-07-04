@@ -80,6 +80,7 @@ research pipeline uses real elevation.</p>
       <button id="t-road" class="active">road ✏️</button>
       <button id="t-built">buildings 🟥</button>
       <button id="t-park">park 🟩</button>
+      <button id="t-water">water 🔵</button>
       <button id="t-erase">erase</button>
       <button id="t-clear">clear</button>
       <label class="filebtn">upload screenshot<input id="file" type="file" accept="image/*"></label>
@@ -100,6 +101,8 @@ research pipeline uses real elevation.</p>
       <span style="background:#6fa8dc"></span>institutional
       <span style="background:#e08f3c"></span>mixed use
       <span style="background:#a8c686"></span>farmland
+      <span style="background:#3a7bd5"></span>water
+      <span style="background:#2a9d8f"></span>suggested bike lane
       <span style="background:#f2b660"></span>orange = untyped growth
       <span style="background:#222"></span>roads
       <span style="background:rgba(150,110,80,0.6)"></span>steep (locked)
@@ -131,6 +134,8 @@ the training data best; megacities will confuse it.</p>
   <span style="background:#6fa8dc"></span>institutional
   <span style="background:#e08f3c"></span>mixed use
   <span style="background:#a8c686"></span>farmland
+      <span style="background:#3a7bd5"></span>water
+      <span style="background:#2a9d8f"></span>suggested bike lane
   <span style="background:#f2b660"></span>orange = untyped growth
   <span style="background:rgba(224,101,95,0.35)"></span>faint = advisory zoning (expansion land)
   <span style="background:rgba(90,140,200,0.7)"></span>water (locked)
@@ -172,13 +177,10 @@ or planning advice · MIT-style, see repo</footer>
 <script>
 "use strict";
 const G = 128, T_STEPS = 1000, OUT_CH = 3, STEPS = 24;
-// COND_CH: channels the DEPLOYED zone_clf/model.onnx expect. The v4 dataset
-// (src/data_v3.py) builds 5-channel conds (+ filled water mask, channel 4),
-// but the weights currently published on this site are still the 4-channel
-// build. TODO(v5 deploy): once the 5-ch expert models ship, bump this to 5
-// and append the water channel in condFrom() -- DO NOT add it before then,
-// it would silently mismatch the deployed ONNX graph's input shape.
-const COND_CH = 4;
+// COND_CH: channels the deployed model_town.onnx / model_urban.onnx expect.
+// v4 deploy: bumped to 5 (+ filled water mask, channel 4) now that the
+// two-expert MoE models are published; condFrom() appends water below.
+const COND_CH = 5;
 const dc = document.getElementById("draw"), dx = dc.getContext("2d");
 const oc = document.getElementById("out"), ox = oc.getContext("2d");
 const statusEl = document.getElementById("status");
@@ -187,9 +189,10 @@ ox.fillStyle = "#ffffff"; ox.fillRect(0, 0, G, G);
 
 /* ---------- drawing ---------- */
 const tools = { road: {c:"#141414", r:0.7}, built: {c:"#c85a3c", r:3},
-                park: {c:"#78b46e", r:3}, erase: {c:"#ffffff", r:4} };
+                park: {c:"#78b46e", r:3}, water: {c:"#3a7bd5", r:3},
+                erase: {c:"#ffffff", r:4} };
 let tool = "road", drawing = false, last = null;
-for (const id of ["road","built","park","erase"]) {
+for (const id of ["road","built","park","water","erase"]) {
   document.getElementById("t-"+id).onclick = (e) => {
     tool = id;
     document.querySelectorAll(".toolbar button").forEach(b=>b.classList.remove("active"));
@@ -228,7 +231,7 @@ document.getElementById("file").onchange = (e) => {
 function parsePlan() {
   const d = dx.getImageData(0,0,G,G).data;
   const roads = new Uint8Array(G*G), built = new Uint8Array(G*G),
-        parks = new Uint8Array(G*G);
+        parks = new Uint8Array(G*G), water = new Uint8Array(G*G);
   for (let i = 0; i < G*G; i++) {
     const r = d[4*i], g = d[4*i+1], b = d[4*i+2];
     const lum = (r*299 + g*587 + b*114) / 1000;
@@ -236,8 +239,9 @@ function parsePlan() {
     if (lum < 70) roads[i] = 1;
     else if (sat > 60 && r > g && r >= b) built[i] = 1;
     else if (sat > 60 && g > r && g >= b) parks[i] = 1;   // green = kept free
+    else if (sat > 60 && b > r && b >= g) water[i] = 1;   // blue = water
   }
-  return { roads, built, parks };
+  return { roads, built, parks, water };
 }
 
 /* ---------- terrain + conditioning (mirrors cond_from_plan) ---------- */
@@ -278,7 +282,7 @@ function slopeDeg(elev) {                     // degrees, 15 m/px (shared with z
   }
   return s;
 }
-function condFrom(roads, built, elev) {
+function condFrom(roads, built, elev, water) {
   const n = G*G;
   let mean=0; for(let i=0;i<n;i++) mean+=elev[i]; mean/=n;
   let sd=0; for(let i=0;i<n;i++) sd+=(elev[i]-mean)**2; sd=Math.sqrt(sd/n)+1e-6;
@@ -301,6 +305,7 @@ function condFrom(roads, built, elev) {
     cond[n+i]     = Math.min(1, Math.max(0, slope[i]/30));
     cond[2*n+i]   = dens[i];
     cond[3*n+i]   = roads[i]*foot[i];
+    cond[4*n+i]   = water ? water[i] : 0;
   }
   return cond;
 }
@@ -490,6 +495,106 @@ async function getZoneClf() {      // lazy; graceful fallback to plain orange on
   }
   return zoneClf;
 }
+let bikeClf = null, bikeClfTried = false;
+async function getBikeClf() {
+  if (!bikeClfTried) {
+    bikeClfTried = true;
+    try { const r = await fetch("model/bike_clf.json"); if (r.ok) bikeClf = await r.json(); }
+    catch (e) {}
+  }
+  return bikeClf;
+}
+function bikeScore(clf, feats) {
+  let z = clf.intercept;
+  for (let i = 0; i < clf.coef.length; i++) z += clf.coef[i]*feats[i];
+  return 1 / (1 + Math.exp(-z));
+}
+function skeletonize(mask, w, h) {
+  const img = new Uint8Array(mask);
+  const at = (y,x) => (y<0||y>=h||x<0||x>=w) ? 0 : img[y*w+x];
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const step of [0,1]) {
+      const toClear = [];
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        if (!at(y,x)) continue;
+        const p2=at(y-1,x),p3=at(y-1,x+1),p4=at(y,x+1),p5=at(y+1,x+1),
+              p6=at(y+1,x),p7=at(y+1,x-1),p8=at(y,x-1),p9=at(y-1,x-1);
+        const ring=[p2,p3,p4,p5,p6,p7,p8,p9,p2];
+        const B=p2+p3+p4+p5+p6+p7+p8+p9;
+        if (B<2||B>6) continue;
+        let A=0;
+        for (let k=0;k<8;k++) if (ring[k]===0 && ring[k+1]===1) A++;
+        if (A!==1) continue;
+        if (step===0) { if (p2*p4*p6!==0) continue; if (p4*p6*p8!==0) continue; }
+        else          { if (p2*p4*p8!==0) continue; if (p2*p6*p8!==0) continue; }
+        toClear.push(y*w+x);
+      }
+      if (toClear.length) { changed = true; for (const idx of toClear) img[idx]=0; }
+    }
+  }
+  return img;
+}
+function skeletonToEdges(skel, w, h) {
+  const N8=[[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]];
+  const at=(y,x)=>(y<0||y>=h||x<0||x>=w)?0:skel[y*w+x];
+  const nbrs=(y,x)=>{const o=[];for(const[dy,dx]of N8)if(at(y+dy,x+dx))o.push([y+dy,x+dx]);return o;};
+  const key=(y,x)=>y*w+x;
+  const nodes=new Set();
+  for (let y=0;y<h;y++) for (let x=0;x<w;x++)
+    if (at(y,x) && nbrs(y,x).length!==2) nodes.add(key(y,x));
+  const edges=[], visited=new Set();
+  for (const nk of nodes) {
+    const ny=Math.floor(nk/w), nx=nk%w;
+    for (const [sy,sx] of nbrs(ny,nx)) {
+      const vk = ny+","+nx+"->"+sy+","+sx;
+      if (visited.has(vk)) continue;
+      const path=[[ny,nx],[sy,sx]];
+      visited.add(vk);
+      let prev=[ny,nx], cur=[sy,sx];
+      while (!nodes.has(key(cur[0],cur[1]))) {
+        const nxt=nbrs(cur[0],cur[1]).filter(p=>!(p[0]===prev[0]&&p[1]===prev[1]));
+        if (!nxt.length) break;
+        prev=cur; cur=nxt[0]; path.push(cur);
+      }
+      visited.add(cur[0]+","+cur[1]+"->"+prev[0]+","+prev[1]);
+      if (path.length>=3) edges.push(path.map(([y,x])=>[x,y]));
+    }
+  }
+  return edges;
+}
+function edgeFeatures(pts, elev, isMajor) {
+  const M=15.0, half=G/2.0;
+  let length=0;
+  for (let i=1;i<pts.length;i++)
+    length += Math.hypot(pts[i][0]-pts[i-1][0], pts[i][1]-pts[i-1][1]) * M;
+  let gradeSum=0, gradeN=0;
+  for (let i=1;i<pts.length;i++) {
+    const [x0,y0]=pts[i-1], [x1,y1]=pts[i];
+    const run = Math.hypot(x1-x0,y1-y0) * M;
+    if (run<1.0) continue;
+    const gy0=Math.min(G-1,Math.max(0,Math.round(y0))), gx0=Math.min(G-1,Math.max(0,Math.round(x0)));
+    const gy1=Math.min(G-1,Math.max(0,Math.round(y1))), gx1=Math.min(G-1,Math.max(0,Math.round(x1)));
+    gradeSum += Math.abs(elev[gy1*G+gx1]-elev[gy0*G+gx0])/run; gradeN++;
+  }
+  const grade = gradeN ? gradeSum/gradeN : 0;
+  const mid = pts[Math.floor(pts.length/2)];
+  const dCenter = Math.hypot(mid[0]-half, mid[1]-half)/half;
+  return [grade, isMajor?1:0, Math.log1p(length), dCenter];
+}
+async function bikeLaneProbs(roadMask, elev) {
+  const clf = await getBikeClf();
+  if (!clf) return null;
+  const skel = skeletonize(roadMask, G, G);
+  const edges = skeletonToEdges(skel, G, G);
+  const painted = new Float32Array(G*G);
+  for (const pts of edges) {
+    const p = bikeScore(clf, edgeFeatures(pts, elev, false));
+    for (const [x,y] of pts) painted[y*G+x] = Math.max(painted[y*G+x], p);
+  }
+  return painted;
+}
 /* ABSTAIN: margin = top raw score minus runner-up (same idea as
    zones.predict_with_margin); context = local built density, box-blurred
    r=4 (feature f3, already computed by zoneFeatureFields). Caller decides
@@ -565,13 +670,45 @@ async function runDDIM(sess, cond, statusNode, keepMask, xKnown) {
   return x;
 }
 
-let session = null, modelMissing = false;
-async function getSession() {
-  if (session || modelMissing) return session;
+let sessions = { town: null, urban: null }, modelMissing = false;
+// ---------- MoE: two experts + moe.py's hard conditioning-stats router ----------
+const SLOPE_T = 0.18, BUILT_T = 0.055, ROAD_T = 0.030;   // mirrors src/moe.py
+function routeExpert(cond) {
+  const n = G*G;
+  let slopeSum = 0, builtN = 0, roadN = 0;
+  for (let i = 0; i < n; i++) {
+    slopeSum += cond[n+i];
+    if (cond[2*n+i] > 0.03) builtN++;
+    if (cond[3*n+i] > 0.5) roadN++;
+  }
+  const slopeMean = slopeSum/n, builtFrac = builtN/n, roadFrac = roadN/n;
+  const votes = (slopeMean < SLOPE_T ? 1:0) + (builtFrac > BUILT_T ? 1:0)
+              + (roadFrac > ROAD_T ? 1:0);
+  return votes >= 2 ? "urban" : "town";
+}
+const MODEL_PARTS = 3;   // each *.onnx split into <10MB parts for hosting
+async function fetchModelBuffer(name) {
+  const bufs = [];
+  for (let p = 1; p <= MODEL_PARTS; p++) {
+    const r = await fetch(`model/${name}.onnx.part${p}`);
+    if (!r.ok) throw new Error(name + " part " + p + " missing");
+    bufs.push(await r.arrayBuffer());
+  }
+  const total = bufs.reduce((a,b)=>a+b.byteLength, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const b of bufs) { out.set(new Uint8Array(b), off); off += b.byteLength; }
+  return out;
+}
+async function getSessions() {
+  if (sessions.town || modelMissing) return sessions;
   try {
-    statusEl.textContent = "loading model weights (~23 MB, first time only)…";
-    session = await ort.InferenceSession.create("model/model.onnx",
-      { executionProviders: ["wasm"] });
+    statusEl.textContent = "loading model weights (~46 MB total, first time only)…";
+    const [townBuf, urbanBuf] = await Promise.all([
+      fetchModelBuffer("model_town"), fetchModelBuffer("model_urban")]);
+    [sessions.town, sessions.urban] = await Promise.all([
+      ort.InferenceSession.create(townBuf, { executionProviders: ["wasm"] }),
+      ort.InferenceSession.create(urbanBuf, { executionProviders: ["wasm"] })]);
   } catch (e) {
     modelMissing = true;
     document.getElementById("modelnote").innerHTML =
@@ -581,18 +718,21 @@ async function getSession() {
       'github/eshankiyer/terrain-urban-diffusion/blob/v3/notebooks/' +
       'v3_zoned_towns_colab.ipynb">Colab notebook</a>, cell 6.</div>';
   }
-  return session;
+  return sessions;
 }
 async function generate() {
   const btn = document.getElementById("go");
   btn.disabled = true;
   try {
-    const {roads, built, parks} = parsePlan();
+    const {roads, built, parks, water} = parsePlan();
     const elev = heightmap(7);
-    const cond = condFrom(roads, built, elev);
+    const cond = condFrom(roads, built, elev, water);
     renderOut(elev, roads, built, parks, null, null, null, null);  // parsed plan now
-    const sess = await getSession();
+    const sessAll = await getSessions();
+    const expert = sessAll.town ? routeExpert(cond) : null;
+    const sess = expert ? sessAll[expert] : null;
     if (!sess) { statusEl.textContent = "showing parsed plan only (no weights)"; return; }
+    statusEl.textContent = "routed to " + expert + " expert…";
     // STEEP LOCK: slope > 25 deg (landslide-proxy threshold, see steepMask)
     // joins the RePaint keepMask like parks -- locked to -1 = no growth.
     const steep = steepMask(elev, 25);
@@ -628,6 +768,15 @@ async function generate() {
     let cg = null;
     if (clf) cg = classifyGrowth(clf, elev, roads, newDens, sparseAmen(amen), mask, null);
     renderOut(elev, roads, built, parks, {newRoads, newDens, mask}, amen, cg, steep);
+    const bikeProb = await bikeLaneProbs(roads, elev);
+    if (bikeProb) {
+      for (let i = 0; i < n; i++)
+        if (bikeProb[i] > 0.5) {
+          const x0 = i % G, y0 = (i / G) | 0;
+          ox.fillStyle = "rgba(42,157,143," + (0.35 + 0.4*bikeProb[i]) + ")";
+          ox.fillRect(x0, y0, 1, 1);
+        }
+    }
     let steepPct = 0; for (let i=0;i<n;i++) steepPct += steep[i];
     steepPct /= n;
     statusEl.textContent = (cg
@@ -964,6 +1113,11 @@ async function paintReal() {
     if (osm.water[i]) cell(i, "rgba(90,140,200,0.35)");
   for (let i = 0; i < n; i++)
     if (osm.roads[i] && !osm.water[i]) cell(i, "rgba(20,20,20,0.72)", 1);
+      const bikeProbReal = await bikeLaneProbs(osm.roads, elev);
+      if (bikeProbReal)
+        for (let i = 0; i < n; i++)
+          if (bikeProbReal[i] > 0.5 && !osm.water[i])
+            cell(i, "rgba(42,157,143," + (0.4 + 0.35*bikeProbReal[i]) + ")");
   overlays.push(L.imageOverlay(cnv.toDataURL(), bounds,
     { opacity: 0.9, className: "crisp" }).addTo(map));
   if (amen) {                                  // proposed local centres
@@ -1002,8 +1156,11 @@ growBtn.onclick = async () => {
     if (sparse)
       statusReal.textContent = "this window has almost no existing town to " +
         "anchor on — the model extrapolates poorly here; try clicking on a small town";
-    const cond = condFrom(osm.roads, osm.built, elev);
-    const sess = await getSession();
+    const cond = condFrom(osm.roads, osm.built, elev, osm.water);
+    const sessAll = await getSessions();
+    const expert = sessAll.town ? routeExpert(cond) : null;
+    const sess = expert ? sessAll[expert] : null;
+    statusReal.textContent = expert ? ("routed to " + expert + " expert; fetching elevation and OSM data") : statusReal.textContent;
     const bounds = windowBounds(pick.lat, pick.lng);
     let x = null, amen = null;
     if (sess) {
@@ -1065,7 +1222,9 @@ document.getElementById("nl-apply").onclick = async () => {
   }
   try {
     if (protectOp) {
-      const sess = await getSession();
+      const sessAllP = await getSessions();
+      const expertP = sessAllP.town ? routeExpert(lastReal.cond) : null;
+      const sess = expertP ? sessAllP[expertP] : null;
       const n = G*G, m = regionMask(protectOp.region);
       const keep = Float32Array.from(m);
       let c = 0; for (let i=0;i<n;i++) c += m[i];
