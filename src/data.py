@@ -222,6 +222,32 @@ def binary_erode(mask, r):
     return _morph(mask, r, "e")
 
 
+def built_mask(dens, thr=0.05, d0=None, min_px=4):
+    """Boolean GRID x GRID mask of "meaningfully built" pixels: `dens`
+    thresholded at `thr`, with existing density `d0` (if given) excluded
+    at the same threshold so only NEW growth remains, then despeckled by
+    dropping 8-connected components smaller than `min_px` pixels.
+
+    Shared helper for zones.assign_zones (and intended for render.py's
+    plan rendering, see zones.py's module docs) so a 1-2 px density blip
+    can't get a zone colour painted on the map that the plan renderer
+    would never show as new growth. Mirrors the despeckle convention the
+    browser demo's dropSmallComponents(mask, 4) already uses client-side."""
+    from scipy.ndimage import label
+    mask = np.asarray(dens) > thr
+    if d0 is not None:
+        mask = mask & ~(np.asarray(d0) > thr)
+    if min_px > 0 and mask.any():
+        structure = np.ones((3, 3), dtype=np.uint8)  # 8-connectivity
+        labeled, n = label(mask, structure=structure)
+        if n > 0:
+            sizes = np.bincount(labeled.ravel())
+            keep = sizes >= min_px
+            keep[0] = False  # background label is never kept
+            mask = keep[labeled]
+    return mask
+
+
 # ----------------------------------------------------------------------------
 # Sample assembly
 # ----------------------------------------------------------------------------
