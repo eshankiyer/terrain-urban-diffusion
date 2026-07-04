@@ -71,3 +71,5 @@ paper/            LaTeX source of the paper
 - Road/building/land-use vectors: © OpenStreetMap contributors (ODbL).
 - Elevation: AWS Terrain Tiles (Mapzen terrarium tiles; various public
   sources incl. SRTM). No API key required.
+
+<!-- redeploy trigger -->
