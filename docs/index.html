@@ -7,6 +7,11 @@
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>
   #map { height: 420px; border:2px solid var(--ink); border-radius:4px; }
+  .star-ic { color:#d62828; font-size:15px; line-height:18px; text-align:center;
+             text-shadow:-1px 0 #fff,1px 0 #fff,0 -1px #fff,0 1px #fff,
+                         -1px -1px #fff,1px 1px #fff; pointer-events:none; }
+  #nl { flex:1 1 280px; font-family:inherit; font-size:0.9rem; padding:7px 10px;
+        border:1.5px solid var(--ink); border-radius:4px; background:#fff; }
 </style>
 <style>
   :root { --ink:#1e2430; --paper:#f7f4ee; --accent:#d05f4e; --soft:#e8e2d6; }
@@ -86,7 +91,11 @@ research pipeline uses real elevation.</p>
     <canvas id="out" width="128" height="128"></canvas>
     <div class="legend">
       <span style="background:#8a8a8a"></span>your plan
-      <span style="background:#f2b660"></span>generated growth
+      <span style="background:#78b46e"></span>kept free (locked)
+      <span style="background:#f2d16b"></span>residential
+      <span style="background:#e0655f"></span>commercial
+      <span style="background:#a58bc4"></span>industrial
+      <span style="background:#6fa8dc"></span>institutional
       <span style="background:#222"></span>roads
       <span style="background:#d62828"></span>★ proposed local centres
     </div>
@@ -106,6 +115,19 @@ the training data best; megacities will confuse it.</p>
   <button id="clear-real">clear overlay</button>
 </div>
 <div id="status-real" class="legend" style="min-height:1.4em"></div>
+<div class="legend" style="margin-top:4px">
+  <span style="background:#8a8a8a"></span>existing town
+  <span style="background:#f2d16b"></span>residential
+  <span style="background:#e0655f"></span>commercial
+  <span style="background:#a58bc4"></span>industrial
+  <span style="background:#6fa8dc"></span>institutional
+  <span style="background:#d62828"></span>★ proposed local centres
+</div>
+<div class="toolbar" style="margin-top:8px">
+  <input id="nl" type="text"
+         placeholder="e.g. more commercial in the north, protect the south">
+  <button id="nl-apply">apply</button>
+</div>
 
 <h2>What you are looking at</h2>
 <p>The model is a compact conditional U-Net (~13M parameters) that denoises
@@ -184,15 +206,17 @@ document.getElementById("file").onchange = (e) => {
 /* ---------- parsing (mirrors plan_import.py) ---------- */
 function parsePlan() {
   const d = dx.getImageData(0,0,G,G).data;
-  const roads = new Uint8Array(G*G), built = new Uint8Array(G*G);
+  const roads = new Uint8Array(G*G), built = new Uint8Array(G*G),
+        parks = new Uint8Array(G*G);
   for (let i = 0; i < G*G; i++) {
     const r = d[4*i], g = d[4*i+1], b = d[4*i+2];
     const lum = (r*299 + g*587 + b*114) / 1000;
     const sat = Math.max(r,g,b) - Math.min(r,g,b);
     if (lum < 70) roads[i] = 1;
     else if (sat > 60 && r > g && r >= b) built[i] = 1;
+    else if (sat > 60 && g > r && g >= b) parks[i] = 1;   // green = kept free
   }
-  return { roads, built };
+  return { roads, built, parks };
 }
 
 /* ---------- terrain + conditioning (mirrors cond_from_plan) ---------- */
@@ -224,16 +248,20 @@ function heightmap(seed, relief=300) {
   for (let i=0;i<G*G;i++) out[i]=(acc[i]-mn)/(mx-mn)*relief;
   return out;
 }
-function condFrom(roads, built, elev) {
-  const n = G*G, M = 15.0;
-  let mean=0; for(let i=0;i<n;i++) mean+=elev[i]; mean/=n;
-  let sd=0; for(let i=0;i<n;i++) sd+=(elev[i]-mean)**2; sd=Math.sqrt(sd/n)+1e-6;
-  const slope = new Float64Array(n);
+function slopeDeg(elev) {                     // degrees, 15 m/px (shared with zoning)
+  const n=G*G, M=15.0, s=new Float64Array(n);
   const at=(y,x)=>elev[Math.max(0,Math.min(G-1,y))*G+Math.max(0,Math.min(G-1,x))];
   for (let y=0;y<G;y++) for (let x=0;x<G;x++) {
     const gx=(at(y,x+1)-at(y,x-1))/(2*M), gy=(at(y+1,x)-at(y-1,x))/(2*M);
-    slope[y*G+x]=Math.atan(Math.hypot(gx,gy))*180/Math.PI;
+    s[y*G+x]=Math.atan(Math.hypot(gx,gy))*180/Math.PI;
   }
+  return s;
+}
+function condFrom(roads, built, elev) {
+  const n = G*G;
+  let mean=0; for(let i=0;i<n;i++) mean+=elev[i]; mean/=n;
+  let sd=0; for(let i=0;i<n;i++) sd+=(elev[i]-mean)**2; sd=Math.sqrt(sd/n)+1e-6;
+  const slope = slopeDeg(elev);
   const dens = new Float32Array(n);
   for (let i=0;i<n;i++) dens[i]=built[i]*0.5;
   const foot = new Uint8Array(n);           // dilate(dens>0.03, r=2)
@@ -256,6 +284,154 @@ function condFrom(roads, built, elev) {
   return cond;
 }
 
+/* ---------- zone typing + steering: pure helpers ---------- */
+/*PURE*/
+const ZONE_NAMES = {1:"residential",2:"commercial",3:"industrial",4:"institutional"};
+const ZONE_RGB = {1:[242,209,107],2:[224,101,95],3:[165,139,196],4:[111,168,220]};
+function boxBlur(src, r, w, h) {   // replicate-edge box blur (ports data_v3._box_blur)
+  w=w||G; h=h||G;
+  if (r<=0) return Float64Array.from(src);
+  const t=new Float64Array(w*h), out=new Float64Array(w*h), k=2*r+1;
+  for (let y=0;y<h;y++) for (let x=0;x<w;x++) {
+    let s=0; for (let d=-r;d<=r;d++) s+=src[y*w+Math.max(0,Math.min(w-1,x+d))];
+    t[y*w+x]=s/k;
+  }
+  for (let y=0;y<h;y++) for (let x=0;x<w;x++) {
+    let s=0; for (let d=-r;d<=r;d++) s+=t[Math.max(0,Math.min(h-1,y+d))*w+x];
+    out[y*w+x]=s/k;
+  }
+  return out;
+}
+function chamferDist(mask, w, h) { // two-pass 3-4 chamfer /3 ~ euclid dist to mask
+  w=w||G; h=h||G;
+  const d=new Float64Array(w*h);
+  for (let i=0;i<w*h;i++) d[i]=mask[i]?0:1e9;
+  for (let y=0;y<h;y++) for (let x=0;x<w;x++) {
+    const i=y*w+x; let v=d[i];
+    if (x>0) v=Math.min(v,d[i-1]+3);
+    if (y>0) { v=Math.min(v,d[i-w]+3);
+      if (x>0)   v=Math.min(v,d[i-w-1]+4);
+      if (x<w-1) v=Math.min(v,d[i-w+1]+4); }
+    d[i]=v;
+  }
+  for (let y=h-1;y>=0;y--) for (let x=w-1;x>=0;x--) {
+    const i=y*w+x; let v=d[i];
+    if (x<w-1) v=Math.min(v,d[i+1]+3);
+    if (y<h-1) { v=Math.min(v,d[i+w]+3);
+      if (x<w-1) v=Math.min(v,d[i+w+1]+4);
+      if (x>0)   v=Math.min(v,d[i+w-1]+4); }
+    d[i]=v;
+  }
+  for (let i=0;i<w*h;i++) d[i]/=3;
+  return d;
+}
+function gbtScores(clf, x) {       // gradient-boosted trees from JSON export
+  const s=clf.baseline.slice();
+  for (const tr of clf.trees) {
+    let i=0;
+    while (!tr.leaf[i]) i = x[tr.feat[i]] <= tr.thr[i] ? tr.left[i] : tr.right[i];
+    s[tr.class]+=tr.val[i];
+  }
+  return s;
+}
+function pickPeaks(a, n, thr, sep, w) {  // ports render.amenity_peaks
+  n=n||4; thr=(thr==null)?0.3:thr; sep=sep||12; w=w||G;
+  const b=Float64Array.from(a), h=b.length/w, peaks=[];
+  for (let k=0;k<n;k++) {
+    let bi=0; for (let i=1;i<b.length;i++) if (b[i]>b[bi]) bi=i;
+    if (b[bi]<thr) break;
+    const y=Math.floor(bi/w), x=bi%w;
+    peaks.push([y,x]);
+    for (let yy=Math.max(0,y-sep);yy<Math.min(h,y+sep);yy++)
+      for (let xx=Math.max(0,x-sep);xx<Math.min(w,x+sep);xx++) b[yy*w+xx]=0;
+  }
+  return peaks;
+}
+function regionMask(name) {
+  const m=new Uint8Array(G*G), h=G/2;
+  for (let y=0;y<G;y++) for (let x=0;x<G;x++) {
+    let ok=true;
+    if (name==="north") ok=y<h; else if (name==="south") ok=y>=h;
+    else if (name==="west") ok=x<h; else if (name==="east") ok=x>=h;
+    else if (name==="centre") ok=Math.hypot(y-h,x-h)<=G/6;
+    if (ok) m[y*G+x]=1;
+  }
+  return m;
+}
+function findRegion(s) {
+  const m=s.match(/\b(north|south|east|west|centre|center|everywhere)\b/);
+  return m ? (m[1]==="center"?"centre":m[1]) : "everywhere";
+}
+function parseCommand(txt) {       // mini version of the planner-agent op grammar
+  const ops=[], bad=[];
+  for (let cl of (txt||"").toLowerCase().split(/[,;]+|\band\b/)) {
+    cl=cl.trim(); if (!cl) continue;
+    let m;
+    if ((m=cl.match(/\b(more|less)\s+(residential|commercial|industrial|institutional)\b/)))
+      ops.push({kind:"bias",
+                zone:{residential:1,commercial:2,industrial:3,institutional:4}[m[2]],
+                w:m[1]==="more"?0.5:-0.5, region:findRegion(cl)});
+    else if ((m=cl.match(/\badd\s+(?:an?\s+)?(school|shop|clinic|amenity|centre|center)\b/)))
+      ops.push({kind:"amenity", region:findRegion(cl.replace(m[0],""))});
+    else if (/\bprotect\b/.test(cl))
+      ops.push({kind:"protect", region:findRegion(cl)});
+    else bad.push(cl);
+  }
+  return {ops, bad};
+}
+function addAmenityBump(a, mask) { // gaussian bump at region centroid, sigma G/16
+  let sy=0,sx=0,c=0;
+  for (let y=0;y<G;y++) for (let x=0;x<G;x++)
+    if (mask[y*G+x]) { sy+=y; sx+=x; c++; }
+  if (!c) return;
+  const cy=sy/c, cx=sx/c, s2=2*(G/16)*(G/16);
+  for (let y=0;y<G;y++) for (let x=0;x<G;x++) {
+    const i=y*G+x;
+    if (mask[i]) a[i]=Math.min(1, a[i]+0.4*Math.exp(-(((y-cy)**2+(x-cx)**2)/s2)));
+  }
+}
+/*ENDPURE*/
+
+/* JS port of src/zones.py feature_stack. COMPROMISE: f4 (amenity field)
+   should be the existing OSM amenity density plus the proposed one; in the
+   browser only the decoded model channel 2 exists (existing + proposed
+   mixed by the model), so that channel is used directly. */
+function zoneFeatureFields(elev, roads, dens, amen) {
+  const n=G*G, half=G/2;
+  const f0=new Float64Array(n), f1=new Float64Array(n);
+  const sl=slopeDeg(elev);
+  for (let y=0;y<G;y++) for (let x=0;x<G;x++)
+    f0[y*G+x]=Math.hypot(y-half,x-half)/half;
+  for (let i=0;i<n;i++) f1[i]=Math.min(1,Math.max(0,sl[i]/30));
+  const f2=new Float64Array(n).fill(1);
+  let any=false; for (let i=0;i<n;i++) if (roads[i]) { any=true; break; }
+  if (any) { const d=chamferDist(roads);
+             for (let i=0;i<n;i++) f2[i]=Math.min(1,d[i]/20); }
+  return [f0, f1, f2, boxBlur(dens,4), Float64Array.from(amen), boxBlur(roads,6)];
+}
+let zoneClf=null, zoneClfTried=false;
+async function getZoneClf() {      // lazy; graceful fallback to plain orange on 404
+  if (!zoneClfTried) {
+    zoneClfTried=true;
+    try { const r=await fetch("model/zone_clf.json"); if (r.ok) zoneClf=await r.json(); }
+    catch(e) {}
+  }
+  return zoneClf;
+}
+function classifyGrowth(clf, elev, roads, dens, amen, mask, biases) {
+  const F=zoneFeatureFields(elev,roads,dens,amen), n=G*G;
+  const out=new Uint8Array(n), xv=new Float64Array(6);
+  for (let i=0;i<n;i++) {
+    if (!mask[i]) continue;
+    for (let k=0;k<6;k++) xv[k]=F[k][i];
+    const s=gbtScores(clf,xv);
+    if (biases) for (const b of biases) if (b.mask[i]) s[b.ci]*=(1+b.w);
+    let bc=0; for (let c=1;c<s.length;c++) if (s[c]>s[bc]) bc=c;
+    out[i]=clf.classes[bc];
+  }
+  return out;
+}
+
 /* ---------- DDIM sampling with onnxruntime-web ---------- */
 function alphasBar() {
   const f = [], s = 0.008;
@@ -269,7 +445,10 @@ function alphasBar() {
   }
   return ab;
 }
-async function runDDIM(sess, cond, statusNode) {
+async function runDDIM(sess, cond, statusNode, keepMask, xKnown) {
+  /* keepMask (G*G, 1=locked) + xKnown (OUT_CH*G*G): RePaint-style region
+     locking — locked pixels are re-injected at the current noise level
+     before every model call, then hard-composited at the end. */
   const n = G*G, ab = alphasBar();
   const rng = mulberry32(1234); gaussSpare = null;
   let x = new Float32Array(OUT_CH*n);
@@ -281,6 +460,11 @@ async function runDDIM(sess, cond, statusNode) {
     statusNode.textContent = `denoising, step ${i+1}/${STEPS}`;
     await new Promise(r=>setTimeout(r));
     const t = ts[i], abT = ab[t];
+    if (keepMask) {
+      const sK=Math.sqrt(abT), sN=Math.sqrt(1-abT);
+      for (let c=0;c<OUT_CH;c++) for (let j=0;j<n;j++)
+        if (keepMask[j]) x[c*n+j] = sK*xKnown[c*n+j] + sN*gauss(rng);
+    }
     const abP = (i+1<STEPS) ? ab[ts[i+1]] : 1.0;
     const feeds = { x: new ort.Tensor("float32", x, [1,OUT_CH,G,G]),
                     cond: condT,
@@ -294,6 +478,9 @@ async function runDDIM(sess, cond, statusNode) {
     }
     x = nx;
   }
+  if (keepMask)
+    for (let c=0;c<OUT_CH;c++) for (let j=0;j<n;j++)
+      if (keepMask[j]) x[c*n+j] = xKnown[c*n+j];
   return x;
 }
 
@@ -319,14 +506,25 @@ async function generate() {
   const btn = document.getElementById("go");
   btn.disabled = true;
   try {
-    const {roads, built} = parsePlan();
+    const {roads, built, parks} = parsePlan();
     const elev = heightmap(7);
     const cond = condFrom(roads, built, elev);
-    renderOut(elev, roads, built, null, null);      // show parsed plan now
+    renderOut(elev, roads, built, parks, null, null, null);  // parsed plan now
     const sess = await getSession();
     if (!sess) { statusEl.textContent = "showing parsed plan only (no weights)"; return; }
-    const x = await runDDIM(sess, cond, statusEl);
+    /* region-locked regeneration: your drawn roads/built are re-injected at
+       their encoded values (2*v-1) at every DDIM step, so the plan is
+       preserved verbatim; green park pixels are locked to -1 = kept free. */
     const n = G*G;
+    const keep = new Float32Array(n), xK = new Float32Array(OUT_CH*n).fill(-1);
+    let lockN = 0;
+    for (let i=0;i<n;i++) if (parks[i] || built[i] || roads[i]) {
+      keep[i]=1; lockN++;
+      xK[i]     = 2*roads[i]-1;             // roads channel
+      xK[n+i]   = built[i] ? 0 : -1;        // density channel (2*0.5-1 for built)
+    }                                       // amenity channel stays -1
+    const x = await runDDIM(sess, cond, statusEl,
+                            lockN?keep:null, lockN?xK:null);
     const newRoads = new Uint8Array(n), newDens = new Float32Array(n), amen = new Float32Array(n);
     for (let i=0;i<n;i++) {
       /* roads channel is not reliable at this dataset size; display skips it */
@@ -334,8 +532,19 @@ async function generate() {
       newDens[i]  = Math.max(0, Math.min(1, (x[n+i]+1)/2));
       amen[i]     = Math.max(0, Math.min(1, (x[2*n+i]+1)/2));
     }
-    renderOut(elev, roads, built, {newRoads, newDens}, amen);
-    statusEl.textContent = "done. grey is your plan, orange is the model's growth";
+    const clf = await getZoneClf();
+    let zones = null;
+    if (clf) {
+      const mask = new Uint8Array(n);
+      for (let i=0;i<n;i++)
+        if (newDens[i]>0.25 && !built[i] && !roads[i] && !parks[i]) mask[i]=1;
+      zones = classifyGrowth(clf, elev, roads, newDens, amen, mask, null);
+    }
+    renderOut(elev, roads, built, parks, {newRoads, newDens}, amen, zones);
+    statusEl.textContent = (zones
+      ? "done. growth typed by use: yellow residential, red commercial, purple industrial, blue institutional"
+      : "done. grey is your plan, orange is the model's growth")
+      + (lockN ? ` · ${lockN} px locked to your plan` : "");
   } catch (err) {
     statusEl.textContent = "error: " + err.message;
   } finally { btn.disabled = false; }
@@ -343,7 +552,7 @@ async function generate() {
 document.getElementById("go").onclick = generate;
 
 /* ---------- output rendering ---------- */
-function renderOut(elev, roads, built, gen, amen) {
+function renderOut(elev, roads, built, parks, gen, amen, zones) {
   const img = ox.createImageData(G, G), n = G*G;
   const at=(y,x)=>elev[Math.max(0,Math.min(G-1,y))*G+Math.max(0,Math.min(G-1,x))];
   for (let y=0;y<G;y++) for (let x=0;x<G;x++) {
@@ -352,27 +561,26 @@ function renderOut(elev, roads, built, gen, amen) {
     const sl=Math.atan(Math.hypot(gx,gy)), asp=Math.atan2(-gx,gy);
     const sh=(Math.sin(0.785)*Math.cos(sl)+Math.cos(0.785)*Math.sin(sl)*Math.cos(5.5-asp)+1)/2;
     let r=200+sh*45, g=198+sh*45, b=188+sh*45;
-    if (gen && gen.newDens[i] > 0.25 && !built[i]) { r=242; g=182; b=96; }
+    if (gen && gen.newDens[i] > 0.25 && !built[i]) {
+      const z = zones ? zones[i] : 0;
+      if (z) { const c=ZONE_RGB[z]; r=c[0]; g=c[1]; b=c[2]; }
+      else { r=242; g=182; b=96; }
+    }
+    if (parks && parks[i]) { r=120; g=180; b=110; }
     if (built[i]) { r=g=b=120; }
     if (roads[i] || (gen && gen.newRoads[i])) { r=g=b=32; }
     img.data[4*i]=r; img.data[4*i+1]=g; img.data[4*i+2]=b; img.data[4*i+3]=255;
   }
   ox.putImageData(img, 0, 0);
   if (amen) {                                  // top proposed centres
-    const a = Float32Array.from(amen);
     ox.fillStyle = "#d62828"; ox.strokeStyle="#fff"; ox.lineWidth=0.4;
-    for (let k=0;k<4;k++) {
-      let bi=0; for (let i=1;i<a.length;i++) if (a[i]>a[bi]) bi=i;
-      if (a[bi] < 0.3) break;
-      const y=Math.floor(bi/G), x=bi%G;
+    for (const [y,x] of pickPeaks(amen, 4, 0.3, 12)) {
       ox.beginPath();
       for (let p=0;p<10;p++) {
         const ang=-Math.PI/2+p*Math.PI/5, rad=p%2?1.6:3.6;
         ox[p?'lineTo':'moveTo'](x+rad*Math.cos(ang), y+rad*Math.sin(ang));
       }
       ox.closePath(); ox.fill(); ox.stroke();
-      for (let yy=Math.max(0,y-12);yy<Math.min(G,y+12);yy++)
-        for (let xx=Math.max(0,x-12);xx<Math.min(G,x+12);xx++) a[yy*G+xx]=0;
     }
   }
 }
@@ -400,8 +608,11 @@ map.on("click", (e) => {
   growBtn.disabled = false;
   statusReal.textContent = `window set at ${pick.lat.toFixed(4)}, ${pick.lng.toFixed(4)}`;
 });
-document.getElementById("clear-real").onclick = () => {
+function clearOverlays() {
   overlays.forEach(o => map.removeLayer(o)); overlays = [];
+}
+document.getElementById("clear-real").onclick = () => {
+  clearOverlays();
   statusReal.textContent = "";
 };
 
@@ -471,6 +682,65 @@ async function fetchOSMReal(lat, lon) {
   return { roads, built };
 }
 
+let lastReal = null;   // {x, osm, elev, cond, bounds, amen, biases} from last grow
+
+/* repaint the overlay + star markers from the cached last output */
+async function paintReal() {
+  const { x, osm, elev, bounds, amen, biases } = lastReal, n = G*G;
+  clearOverlays();
+  /* draw at 4x with hard-edged cells; roads get a 1px pad so 1-px lines
+     stay continuous instead of dissolving into dashes when Leaflet
+     stretches the image over the basemap */
+  const S = 4;
+  const cnv = document.createElement("canvas");
+  cnv.width = G * S; cnv.height = G * S;
+  const ctx = cnv.getContext("2d");
+  const cell = (i, color, pad = 0) => {
+    ctx.fillStyle = color;
+    ctx.fillRect((i % G) * S - pad, Math.floor(i / G) * S - pad,
+                 S + 2 * pad, S + 2 * pad);
+  };
+  let typed = false;
+  if (!x) {
+    for (let i = 0; i < n; i++)
+      if (osm.built[i] && !osm.roads[i]) cell(i, "rgba(120,120,120,0.62)");
+  } else {
+    const dNew = new Float32Array(n), mask = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      dNew[i] = Math.max(0, Math.min(1, (x[n+i]+1)/2));
+      if (dNew[i] > 0.25 && !osm.built[i] && !osm.roads[i]) mask[i] = 1;
+    }
+    const clf = await getZoneClf();
+    /* roads feature: model roads are hidden as unreliable, so zoning sees
+       only the existing OSM network (pipeline uses existing+generated) */
+    const zones = clf
+      ? classifyGrowth(clf, elev, osm.roads, dNew, amen, mask, biases) : null;
+    typed = !!zones;
+    const zc = {1:"rgba(242,209,107,0.8)", 2:"rgba(224,101,95,0.8)",
+                3:"rgba(165,139,196,0.8)", 4:"rgba(111,168,220,0.8)"};
+    for (let i = 0; i < n; i++) {
+      if (osm.built[i] && !osm.roads[i]) cell(i, "rgba(120,120,120,0.55)");
+      else if (mask[i])
+        cell(i, zones && zones[i] ? zc[zones[i]] : "rgba(242,182,96,0.78)");
+    }
+  }
+  for (let i = 0; i < n; i++)
+    if (osm.roads[i]) cell(i, "rgba(20,20,20,0.72)", 1);
+  overlays.push(L.imageOverlay(cnv.toDataURL(), bounds,
+    { opacity: 0.9, className: "crisp" }).addTo(map));
+  if (amen) {                                  // proposed local centres
+    const [s0, w0] = bounds[0], [nn, e0] = bounds[1];
+    for (const [py, px] of pickPeaks(amen, 4, 0.3, 12)) {
+      const la = nn - (py + 0.5) / G * (nn - s0);
+      const lo = w0 + (px + 0.5) / G * (e0 - w0);
+      overlays.push(L.marker([la, lo], { interactive: false,
+        icon: L.divIcon({ className: "star-ic", html: "★",
+                          iconSize: [18,18], iconAnchor: [9,9] }) }).addTo(map));
+    }
+  }
+  return typed;
+}
+
 growBtn.onclick = async () => {
   if (!pick) return;
   growBtn.disabled = true;
@@ -478,47 +748,87 @@ growBtn.onclick = async () => {
     statusReal.textContent = "fetching elevation and OSM data";
     const [elev, osm] = await Promise.all([
       fetchElevReal(pick.lat, pick.lng), fetchOSMReal(pick.lat, pick.lng)]);
+    const n = G*G;
+    let anchor = 0;
+    for (let i = 0; i < n; i++) if (osm.built[i] || osm.roads[i]) anchor++;
+    const sparse = anchor < 0.005 * n;
+    if (sparse)
+      statusReal.textContent = "this window has almost no existing town to " +
+        "anchor on — the model extrapolates poorly here; try clicking on a small town";
     const cond = condFrom(osm.roads, osm.built, elev);
     const sess = await getSession();
     const bounds = windowBounds(pick.lat, pick.lng);
-    /* draw at 4x with hard-edged cells; roads get a 1px pad so 1-px lines
-       stay continuous instead of dissolving into dashes when Leaflet
-       stretches the image over the basemap */
-    const S = 4;
-    const cnv = document.createElement("canvas");
-    cnv.width = G * S; cnv.height = G * S;
-    const ctx = cnv.getContext("2d");
-    const cell = (i, color, pad = 0) => {
-      ctx.fillStyle = color;
-      ctx.fillRect((i % G) * S - pad, Math.floor(i / G) * S - pad,
-                   S + 2 * pad, S + 2 * pad);
-    };
-    if (!sess) {
-      for (let i = 0; i < G*G; i++)
-        if (osm.built[i] && !osm.roads[i]) cell(i, "rgba(120,120,120,0.62)");
-      for (let i = 0; i < G*G; i++)
-        if (osm.roads[i]) cell(i, "rgba(20,20,20,0.78)", 1);
-      statusReal.textContent = "no model weights yet: overlay shows the parsed existing town";
-    } else {
-      const x = await runDDIM(sess, cond, statusReal);
-      const n = G*G;
-      for (let i = 0; i < n; i++) {
-        const dNew = Math.max(0, Math.min(1, (x[n+i]+1)/2));
-        if (osm.built[i] && !osm.roads[i]) cell(i, "rgba(120,120,120,0.55)");
-        else if (dNew > 0.25 && !osm.roads[i]) cell(i, "rgba(242,182,96,0.78)");
-      }
+    let x = null, amen = null;
+    if (sess) {
+      x = await runDDIM(sess, cond, statusReal);
+      amen = new Float32Array(n);
       for (let i = 0; i < n; i++)
-        if (osm.roads[i]) cell(i, "rgba(20,20,20,0.72)", 1);
-      statusReal.textContent = "done. orange is where the model adds growth";
+        amen[i] = Math.max(0, Math.min(1, (x[2*n+i]+1)/2));
     }
-    const ov = L.imageOverlay(cnv.toDataURL(), bounds,
-      { opacity: 0.9, className: "crisp" }).addTo(map);
-    overlays.push(ov);
+    lastReal = { x, osm, elev, cond, bounds, amen, biases: [] };
+    const typed = await paintReal();
+    statusReal.textContent =
+      (!x ? "no model weights yet: overlay shows the parsed existing town"
+        : typed ? "done. growth typed by use: yellow residential, red commercial, purple industrial, blue institutional"
+        : "done. orange is where the model adds growth")
+      + (sparse ? " · warning: almost no existing town in this window" : "");
     map.fitBounds(bounds);
   } catch (err) {
     statusReal.textContent = "error: " + err.message;
   } finally { growBtn.disabled = false; }
 };
+
+/* ---------- natural-language steering of the last map result ---------- */
+document.getElementById("nl-apply").onclick = async () => {
+  const inp = document.getElementById("nl");
+  if (!lastReal || !lastReal.x) {
+    statusReal.textContent = "grow a place first (with model weights), then steer it";
+    return;
+  }
+  const { ops, bad } = parseCommand(inp.value);
+  if (!ops.length) {
+    statusReal.textContent = "could not parse" +
+      (bad.length ? ': "' + bad.join('", "') + '"' : " (empty command)") +
+      ' — try "more commercial in the north"';
+    return;
+  }
+  const applied = [];
+  let protectOp = null;
+  for (const op of ops) {
+    if (op.kind === "bias") {
+      lastReal.biases.push({ ci: op.zone-1, w: op.w, mask: regionMask(op.region) });
+      applied.push(`${op.w>0?"more":"less"} ${ZONE_NAMES[op.zone]} (${op.region})`);
+    } else if (op.kind === "amenity") {
+      addAmenityBump(lastReal.amen, regionMask(op.region));
+      applied.push(`add amenity (${op.region})`);
+    } else {                                   // protect: rerun with locking
+      protectOp = op;
+      applied.push(`protect (${op.region})`);
+    }
+  }
+  try {
+    if (protectOp) {
+      const sess = await getSession();
+      const n = G*G, m = regionMask(protectOp.region);
+      const keep = Float32Array.from(m);
+      let c = 0; for (let i=0;i<n;i++) c += m[i];
+      const xK = new Float32Array(OUT_CH*n).fill(-1);   // locked = kept free
+      statusReal.textContent = `re-sampling with ${c} px locked`;
+      lastReal.x = await runDDIM(sess, lastReal.cond, statusReal, keep, xK);
+      for (let i=0;i<n;i++)
+        lastReal.amen[i] = Math.max(0, Math.min(1, (lastReal.x[2*n+i]+1)/2));
+    }
+    await paintReal();
+    statusReal.textContent = "applied: " + applied.join("; ") +
+      (protectOp ? ` · ${regionMask(protectOp.region).reduce((a,b)=>a+b,0)} px locked` : "") +
+      (bad.length ? " · ignored: " + bad.join("; ") : "");
+  } catch (err) {
+    statusReal.textContent = "error: " + err.message;
+  }
+};
+document.getElementById("nl").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") document.getElementById("nl-apply").click();
+});
 
 /* seed the canvas with the demo sketch so the page isn't blank */
 (function demo(){
