@@ -874,11 +874,22 @@ async function paintReal() {
     const foot = new Float64Array(n);
     for (let i = 0; i < n; i++) foot[i] = (osm.built[i] || osm.roads[i]) ? 1 : 0;
     const near = boxBlur(foot, 8);
+    // SELF-CALIBRATING interior cutoff: a fixed density number doesn't
+    // generalize across towns with very different OSM tagging completeness.
+    // Measured against real Vaduz data, mapped building+road pixels cover
+    // only ~17% of the window even at its historic core (r=8 p90 is ~0.40),
+    // so a flat 0.45 cutoff excluded almost nothing (~6-10% of the window)
+    // and the fix was a no-op in practice. Use the window's own mean local
+    // density instead: denser-than-average = interior fabric, everything
+    // below the town's own average = fringe/eligible. Self-adjusts per town.
+    let nearMean = 0;
+    for (let i = 0; i < n; i++) nearMean += near[i];
+    nearMean = Math.max(0.05, nearMean / n);
     const dNew = new Float32Array(n), rawMask = new Uint8Array(n);
     for (let i = 0; i < n; i++) {
       dNew[i] = Math.max(0, Math.min(1, (x[n+i]+1)/2));
       if (dNew[i] > 0.25 && !osm.built[i] && !osm.roads[i] && !osm.water[i]
-          && !steep[i] && near[i] < 0.45) rawMask[i] = 1;
+          && !steep[i] && near[i] < nearMean) rawMask[i] = 1;
     }
     // despeckle: drop 8-connected components < 4 px (mirrors data.built_mask)
     const mask = dropSmallComponents(rawMask, 4);
