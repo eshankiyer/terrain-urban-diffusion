@@ -99,8 +99,10 @@ research pipeline uses real elevation.</p>
       <span style="background:#a58bc4"></span>industrial
       <span style="background:#6fa8dc"></span>institutional
       <span style="background:#e08f3c"></span>mixed use
+      <span style="background:#a8c686"></span>farmland
       <span style="background:#f2b660"></span>orange = untyped growth
       <span style="background:#222"></span>roads
+      <span style="background:rgba(150,110,80,0.6)"></span>steep (locked)
       <span style="background:#d62828"></span>★ proposed local centres
     </div>
     <div id="modelnote"></div>
@@ -128,8 +130,11 @@ the training data best; megacities will confuse it.</p>
   <span style="background:#a58bc4"></span>industrial
   <span style="background:#6fa8dc"></span>institutional
   <span style="background:#e08f3c"></span>mixed use
+  <span style="background:#a8c686"></span>farmland
   <span style="background:#f2b660"></span>orange = untyped growth
+  <span style="background:rgba(224,101,95,0.35)"></span>faint = advisory zoning (expansion land)
   <span style="background:rgba(90,140,200,0.7)"></span>water (locked)
+  <span style="background:rgba(150,110,80,0.6)"></span>steep (locked)
   <span style="background:#d62828"></span>★ proposed local centres
 </div>
 <div class="toolbar" style="margin-top:8px">
@@ -302,10 +307,13 @@ function condFrom(roads, built, elev) {
 
 /* ---------- zone typing + steering: pure helpers ---------- */
 /*PURE*/
-const ZONE_NAMES = {1:"residential",2:"commercial",3:"industrial",4:"institutional",5:"mixed"};
-// Class 5 ("mixed use") won't fire until the retrained zone_clf.json ships
-// (deployed weights only know classes 1-4) -- colour is wired up ready for it.
-const ZONE_RGB = {1:[242,209,107],2:[224,101,95],3:[165,139,196],4:[111,168,220],5:[224,143,60]};
+const ZONE_NAMES = {1:"residential",2:"commercial",3:"industrial",4:"institutional",5:"mixed",6:"farmland"};
+// Classes 5 ("mixed use") and 6 ("farmland") won't fire until the retrained
+// zone_clf.json ships (deployed weights only know classes 1-4) -- colours
+// are wired up ready for it. Farmland gives a growth pixel that reads as
+// rural, not urban, somewhere honest to land instead of a forced pick
+// among the four urban classes (see src/data_v3.py module docstring).
+const ZONE_RGB = {1:[242,209,107],2:[224,101,95],3:[165,139,196],4:[111,168,220],5:[224,143,60],6:[168,198,134]};
 function boxBlur(src, r, w, h) {   // replicate-edge box blur (ports data_v3._box_blur)
   w=w||G; h=h||G;
   if (r<=0) return Float64Array.from(src);
@@ -407,6 +415,45 @@ function addAmenityBump(a, mask) { // gaussian bump at region centroid, sigma G/
     const i=y*G+x;
     if (mask[i]) a[i]=Math.min(1, a[i]+0.4*Math.exp(-(((y-cy)**2+(x-cx)**2)/s2)));
   }
+}
+// STEEP LOCK: slope > 25 deg matches environment.SLOPE_PRONE_DEG, the
+// pipeline's landslide-proxy threshold (NOT the 15-20% grade planners use
+// for road/driveway limits -- this site mirrors the training-side hazard
+// proxy, not a construction code). Ports environment.landslide_masks'
+// "prone" threshold as a boolean mask.
+function steepMask(elev, thrDeg) {
+  thrDeg = (thrDeg==null) ? 25 : thrDeg;
+  const sl = slopeDeg(elev), n = sl.length, out = new Uint8Array(n);
+  for (let i=0;i<n;i++) out[i] = sl[i] > thrDeg ? 1 : 0;
+  return out;
+}
+// Despeckle: drop 8-connected components smaller than minPx. Small
+// iterative (stack-based, not recursive) flood fill -- ports
+// data._drop_small_components so the site can't paint/type a growth speck
+// the python pipeline's built_mask would have thrown away. Fine at
+// G=128x128; not meant for anything bigger.
+function dropSmallComponents(mask, minPx, w, h) {
+  w=w||G; h=h||G;
+  const seen = new Uint8Array(w*h), out = new Uint8Array(w*h);
+  const stack = [];
+  for (let y0=0;y0<h;y0++) for (let x0=0;x0<w;x0++) {
+    const i0 = y0*w+x0;
+    if (!mask[i0] || seen[i0]) continue;
+    const comp = [i0];
+    seen[i0] = 1; stack.length = 0; stack.push(i0);
+    while (stack.length) {
+      const i = stack.pop(), y = Math.floor(i/w), x = i%w;
+      for (let dy=-1;dy<=1;dy++) for (let dx=-1;dx<=1;dx++) {
+        if (!dy && !dx) continue;
+        const ny=y+dy, nx=x+dx;
+        if (ny<0||ny>=h||nx<0||nx>=w) continue;
+        const j = ny*w+nx;
+        if (mask[j] && !seen[j]) { seen[j]=1; stack.push(j); comp.push(j); }
+      }
+    }
+    if (comp.length >= minPx) for (const j of comp) out[j] = 1;
+  }
+  return out;
 }
 /*ENDPURE*/
 
@@ -543,18 +590,22 @@ async function generate() {
     const {roads, built, parks} = parsePlan();
     const elev = heightmap(7);
     const cond = condFrom(roads, built, elev);
-    renderOut(elev, roads, built, parks, null, null, null);  // parsed plan now
+    renderOut(elev, roads, built, parks, null, null, null, null);  // parsed plan now
     const sess = await getSession();
     if (!sess) { statusEl.textContent = "showing parsed plan only (no weights)"; return; }
+    // STEEP LOCK: slope > 25 deg (landslide-proxy threshold, see steepMask)
+    // joins the RePaint keepMask like parks -- locked to -1 = no growth.
+    const steep = steepMask(elev, 25);
     /* region-locked regeneration: your drawn roads/built are re-injected at
        their encoded values (2*v-1) at every DDIM step, so the plan is
-       preserved verbatim; green park pixels are locked to -1 = kept free. */
+       preserved verbatim; green park and steep-slope pixels are locked to
+       -1 = kept free. */
     const n = G*G;
     const keep = new Float32Array(n), xK = new Float32Array(OUT_CH*n).fill(-1);
     let lockN = 0;
-    for (let i=0;i<n;i++) if (parks[i] || built[i] || roads[i]) {
+    for (let i=0;i<n;i++) if (parks[i] || built[i] || roads[i] || steep[i]) {
       keep[i]=1; lockN++;
-      xK[i]     = 2*roads[i]-1;             // roads channel
+      xK[i]     = built[i] || roads[i] ? 2*roads[i]-1 : -1;  // roads channel
       xK[n+i]   = built[i] ? 0 : -1;        // density channel (2*0.5-1 for built)
     }                                       // amenity channel stays -1
     const x = await runDDIM(sess, cond, statusEl,
@@ -566,19 +617,24 @@ async function generate() {
       newDens[i]  = Math.max(0, Math.min(1, (x[n+i]+1)/2));
       amen[i]     = Math.max(0, Math.min(1, (x[2*n+i]+1)/2));
     }
+    // growth mask: threshold, exclude locked pixels (incl. steep), then
+    // drop 8-connected components < 4 px (mirrors data.built_mask) so a
+    // 1-2 px density blip can't get typed or painted.
+    const rawMask = new Uint8Array(n);
+    for (let i=0;i<n;i++)
+      if (newDens[i]>0.25 && !built[i] && !roads[i] && !parks[i] && !steep[i]) rawMask[i]=1;
+    const mask = dropSmallComponents(rawMask, 4);
     const clf = await getZoneClf();
     let cg = null;
-    if (clf) {
-      const mask = new Uint8Array(n);
-      for (let i=0;i<n;i++)
-        if (newDens[i]>0.25 && !built[i] && !roads[i] && !parks[i]) mask[i]=1;
-      cg = classifyGrowth(clf, elev, roads, newDens, sparseAmen(amen), mask, null);
-    }
-    renderOut(elev, roads, built, parks, {newRoads, newDens}, amen, cg);
+    if (clf) cg = classifyGrowth(clf, elev, roads, newDens, sparseAmen(amen), mask, null);
+    renderOut(elev, roads, built, parks, {newRoads, newDens, mask}, amen, cg, steep);
+    let steepPct = 0; for (let i=0;i<n;i++) steepPct += steep[i];
+    steepPct /= n;
     statusEl.textContent = (cg
       ? "done. growth typed by use: yellow residential, red commercial, purple industrial, blue institutional, orange mixed use (orange = untyped growth)"
       : "done. grey is your plan, orange is the model's growth")
-      + (lockN ? ` · ${lockN} px locked to your plan` : "");
+      + (lockN ? ` · ${lockN} px locked to your plan` : "")
+      + (steepPct > 0.7 ? " · warning: most of this terrain is too steep to build" : "");
   } catch (err) {
     statusEl.textContent = "error: " + err.message;
   } finally { btn.disabled = false; }
@@ -587,7 +643,7 @@ document.getElementById("go").onclick = generate;
 
 /* ---------- output rendering ---------- */
 const RES_TIER_RGB = [[247,227,161], [242,209,107], [217,177,59]]; // low/med/high
-function renderOut(elev, roads, built, parks, gen, amen, cg) {
+function renderOut(elev, roads, built, parks, gen, amen, cg, steep) {
   const img = ox.createImageData(G, G), n = G*G;
   const at=(y,x)=>elev[Math.max(0,Math.min(G-1,y))*G+Math.max(0,Math.min(G-1,x))];
   for (let y=0;y<G;y++) for (let x=0;x<G;x++) {
@@ -596,7 +652,9 @@ function renderOut(elev, roads, built, parks, gen, amen, cg) {
     const sl=Math.atan(Math.hypot(gx,gy)), asp=Math.atan2(-gx,gy);
     const sh=(Math.sin(0.785)*Math.cos(sl)+Math.cos(0.785)*Math.sin(sl)*Math.cos(5.5-asp)+1)/2;
     let r=200+sh*45, g=198+sh*45, b=188+sh*45;
-    if (gen && gen.newDens[i] > 0.25 && !built[i]) {
+    // growth mask is precomputed by generate() (threshold + lock exclusion
+    // + dropSmallComponents), so painting can never disagree with typing.
+    if (gen && gen.mask && gen.mask[i]) {
       // ABSTAIN: only trust a typed colour when margin/context clear the bar
       const z = (cg && cg.zones[i] && cg.margin[i] > 0.5 && cg.context[i] > 0.02)
         ? cg.zones[i] : 0;
@@ -608,6 +666,9 @@ function renderOut(elev, roads, built, parks, gen, amen, cg) {
     }
     if (parks && parks[i]) { r=120; g=180; b=110; }
     if (built[i]) { r=g=b=120; }
+    // STEEP LOCK wash: faint even over built/parks so the terrain hazard
+    // reads without hiding what's already there.
+    if (steep && steep[i]) { r=r*0.75+150*0.25; g=g*0.75+110*0.25; b=b*0.75+80*0.25; }
     if (roads[i] || (gen && gen.newRoads[i])) { r=g=b=32; }
     img.data[4*i]=r; img.data[4*i+1]=g; img.data[4*i+2]=b; img.data[4*i+3]=255;
   }
@@ -780,11 +841,11 @@ async function fetchOSMReal(lat, lon) {
   return { roads, built, water, amenReal };
 }
 
-let lastReal = null;   // {x, osm, elev, cond, bounds, amen, biases} from last grow
+let lastReal = null;   // {x, osm, elev, bounds, amen, biases, steep} from last grow
 
 /* repaint the overlay + star markers from the cached last output */
 async function paintReal() {
-  const { x, osm, elev, bounds, amen, biases } = lastReal, n = G*G;
+  const { x, osm, elev, bounds, amen, biases, steep } = lastReal, n = G*G;
   clearOverlays();
   /* draw at 4x with hard-edged cells; roads get a 1px pad so 1-px lines
      stay continuous instead of dissolving into dashes when Leaflet
@@ -803,11 +864,14 @@ async function paintReal() {
     for (let i = 0; i < n; i++)
       if (osm.built[i] && !osm.roads[i] && !osm.water[i]) cell(i, "rgba(120,120,120,0.62)");
   } else {
-    const dNew = new Float32Array(n), mask = new Uint8Array(n);
+    const dNew = new Float32Array(n), rawMask = new Uint8Array(n);
     for (let i = 0; i < n; i++) {
       dNew[i] = Math.max(0, Math.min(1, (x[n+i]+1)/2));
-      if (dNew[i] > 0.25 && !osm.built[i] && !osm.roads[i] && !osm.water[i]) mask[i] = 1;
+      if (dNew[i] > 0.25 && !osm.built[i] && !osm.roads[i] && !osm.water[i]
+          && !steep[i]) rawMask[i] = 1;
     }
+    // despeckle: drop 8-connected components < 4 px (mirrors data.built_mask)
+    const mask = dropSmallComponents(rawMask, 4);
     const clf = await getZoneClf();
     /* roads feature: model roads are hidden as unreliable, so zoning sees
        only the existing OSM network (pipeline uses existing+generated) */
@@ -818,13 +882,13 @@ async function paintReal() {
     typed = !!zones;
     const zc = {1:"rgba(242,209,107,0.8)", 2:"rgba(224,101,95,0.8)",
                 3:"rgba(165,139,196,0.8)", 4:"rgba(111,168,220,0.8)",
-                5:"rgba(224,143,60,0.8)"};
+                5:"rgba(224,143,60,0.8)", 6:"rgba(168,198,134,0.8)"};
     // residential density tiers (display-only, decoded from dNew)
     const resTier = (v) => v > 0.6 ? "rgba(217,177,59,0.85)"
                           : v > 0.35 ? "rgba(242,209,107,0.8)"
                           : "rgba(247,227,161,0.75)";
     for (let i = 0; i < n; i++) {
-      if (osm.water[i]) continue;              // never paint on water
+      if (osm.water[i] || steep[i]) continue;   // never paint on water/steep
       if (osm.built[i] && !osm.roads[i]) cell(i, "rgba(120,120,120,0.55)");
       else if (mask[i]) {
         // ABSTAIN: below the margin/context threshold, stay plain orange
@@ -836,7 +900,34 @@ async function paintReal() {
         else cell(i, "rgba(242,182,96,0.78)");  // orange = untyped growth
       }
     }
+    /* ADVISORY ZONING over potential expansion land: the undeveloped ring
+       around the existing fabric, typed by the same classifier, painted
+       faint. Answers "if this parcel develops, what use fits its context"
+       BEFORE any sample commits growth there; the sampled growth above
+       stays full-strength so proposal and advice read differently. */
+    if (zones) {
+      const foot = new Float64Array(n);
+      for (let i = 0; i < n; i++) foot[i] = (osm.built[i] || osm.roads[i]) ? 1 : 0;
+      const near = boxBlur(foot, 8);          // square dilation via box blur
+      const cand = new Uint8Array(n);
+      for (let i = 0; i < n; i++)
+        if (near[i] > 1e-9 && !foot[i] && !osm.water[i] && !steep[i] && !mask[i])
+          cand[i] = 1;
+      const densCtx = new Float64Array(n);    // context = existing town + proposal
+      for (let i = 0; i < n; i++)
+        densCtx[i] = Math.max(dNew[i], osm.built[i] ? 0.5 : 0);
+      const adv = classifyGrowth(clf, elev, osm.roads, densCtx,
+                                 osm.amenReal || sparseAmen(amen), cand, biases);
+      const za = {1:"rgba(242,209,107,0.35)", 2:"rgba(224,101,95,0.35)",
+                  3:"rgba(165,139,196,0.35)", 4:"rgba(111,168,220,0.35)",
+                  5:"rgba(224,143,60,0.35)", 6:"rgba(168,198,134,0.35)"};
+      for (let i = 0; i < n; i++)
+        if (cand[i] && adv.zones[i] && adv.margin[i] > 0.5)
+          cell(i, za[adv.zones[i]]);
+    }
   }
+  for (let i = 0; i < n; i++)
+    if (steep[i] && !osm.water[i]) cell(i, "rgba(150,110,80,0.25)");
   for (let i = 0; i < n; i++)
     if (osm.water[i]) cell(i, "rgba(90,140,200,0.35)");
   for (let i = 0; i < n; i++)
@@ -864,13 +955,18 @@ growBtn.onclick = async () => {
     const [elev, osm] = await Promise.all([
       fetchElevReal(pick.lat, pick.lng), fetchOSMReal(pick.lat, pick.lng)]);
     const n = G*G;
-    let anchor = 0, waterN = 0;
+    // STEEP LOCK: slope > 25 deg (landslide-proxy threshold, see steepMask)
+    // from the real fetched elevation, same idea as the water lock below.
+    const steep = steepMask(elev, 25);
+    let anchor = 0, waterN = 0, steepOrWaterN = 0;
     for (let i = 0; i < n; i++) {
       if (osm.built[i] || osm.roads[i]) anchor++;
       if (osm.water[i]) waterN++;
+      if (steep[i] || osm.water[i]) steepOrWaterN++;
     }
     const sparse = anchor < 0.005 * n;
     const mostlyWater = waterN > 0.6 * n;
+    const littleBuildable = steepOrWaterN > 0.7 * n;
     if (sparse)
       statusReal.textContent = "this window has almost no existing town to " +
         "anchor on — the model extrapolates poorly here; try clicking on a small town";
@@ -879,24 +975,28 @@ growBtn.onclick = async () => {
     const bounds = windowBounds(pick.lat, pick.lng);
     let x = null, amen = null;
     if (sess) {
-      // WATER LOCK: lock the sampler to no-growth (-1, every channel) on
-      // water pixels so it cannot build on lakes/rivers, RePaint-style.
-      const keep = Float32Array.from(osm.water);
-      const anyWater = waterN > 0;
-      const xK = anyWater ? new Float32Array(OUT_CH*n).fill(-1) : null;
-      x = await runDDIM(sess, cond, statusReal, anyWater ? keep : null, xK);
+      // WATER + STEEP LOCK: lock the sampler to no-growth (-1, every
+      // channel) on water and steep-slope pixels so it cannot build on
+      // lakes/rivers or landslide-prone terrain, RePaint-style.
+      const keep = new Float32Array(n);
+      for (let i = 0; i < n; i++) keep[i] = (osm.water[i] || steep[i]) ? 1 : 0;
+      const anyLocked = steepOrWaterN > 0;
+      const xK = anyLocked ? new Float32Array(OUT_CH*n).fill(-1) : null;
+      x = await runDDIM(sess, cond, statusReal, anyLocked ? keep : null, xK);
       amen = new Float32Array(n);
       for (let i = 0; i < n; i++)
         amen[i] = Math.max(0, Math.min(1, (x[2*n+i]+1)/2));
     }
-    lastReal = { x, osm, elev, cond, bounds, amen, biases: [] };
+    lastReal = { x, osm, elev, cond, bounds, amen, biases: [], steep };
     const typed = await paintReal();
     statusReal.textContent =
       (!x ? "no model weights yet: overlay shows the parsed existing town"
-        : typed ? "done. growth typed by use: yellow residential, red commercial, purple industrial, blue institutional (orange = untyped growth)"
+        : typed ? "done. solid colours = the model's proposed growth, typed by use; faint colours = advisory zoning for land that could develop next"
         : "done. orange is where the model adds growth")
       + (sparse ? " · warning: almost no existing town in this window" : "")
-      + (mostlyWater ? " · warning: most of this window is water" : "");
+      + (mostlyWater ? " · warning: most of this window is water" : "")
+      + (littleBuildable ? " · warning: little buildable land remains " +
+         "(steep slopes + water cover most of this window)" : "");
     map.fitBounds(bounds);
   } catch (err) {
     statusReal.textContent = "error: " + err.message;
