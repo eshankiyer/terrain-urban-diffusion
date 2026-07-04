@@ -864,11 +864,21 @@ async function paintReal() {
     for (let i = 0; i < n; i++)
       if (osm.built[i] && !osm.roads[i] && !osm.water[i]) cell(i, "rgba(120,120,120,0.62)");
   } else {
+    // "near" = box-blurred existing built+road footprint (r=8, ~250 m box).
+    // Gates genuine expansion land away from interior in-fill: OSM building
+    // polygons rarely cover every already-developed pixel (courtyards,
+    // plazas, gaps between mapped footprints), so without this the model's
+    // predicted density lights up almost the whole town core, not just the
+    // fringe -- which is exactly the "doesn't show planners where to
+    // expand" problem. Reused below for the advisory-zoning ring too.
+    const foot = new Float64Array(n);
+    for (let i = 0; i < n; i++) foot[i] = (osm.built[i] || osm.roads[i]) ? 1 : 0;
+    const near = boxBlur(foot, 8);
     const dNew = new Float32Array(n), rawMask = new Uint8Array(n);
     for (let i = 0; i < n; i++) {
       dNew[i] = Math.max(0, Math.min(1, (x[n+i]+1)/2));
       if (dNew[i] > 0.25 && !osm.built[i] && !osm.roads[i] && !osm.water[i]
-          && !steep[i]) rawMask[i] = 1;
+          && !steep[i] && near[i] < 0.45) rawMask[i] = 1;
     }
     // despeckle: drop 8-connected components < 4 px (mirrors data.built_mask)
     const mask = dropSmallComponents(rawMask, 4);
@@ -906,9 +916,6 @@ async function paintReal() {
        BEFORE any sample commits growth there; the sampled growth above
        stays full-strength so proposal and advice read differently. */
     if (zones) {
-      const foot = new Float64Array(n);
-      for (let i = 0; i < n; i++) foot[i] = (osm.built[i] || osm.roads[i]) ? 1 : 0;
-      const near = boxBlur(foot, 8);          // square dilation via box blur
       const cand = new Uint8Array(n);
       for (let i = 0; i < n; i++)
         if (near[i] > 1e-9 && !foot[i] && !osm.water[i] && !steep[i] && !mask[i])
