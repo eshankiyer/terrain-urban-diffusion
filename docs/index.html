@@ -24,6 +24,7 @@
   canvas { width:100%; max-width:440px; image-rendering:pixelated;
            border:2px solid var(--ink); border-radius:4px; background:#fff;
            touch-action:none; display:block; }
+  .crisp { image-rendering:pixelated; }
   .toolbar { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0; }
   button, label.filebtn { font-family:inherit; font-size:0.9rem; padding:7px 14px;
            border:1.5px solid var(--ink); background:#fff; border-radius:4px;
@@ -479,32 +480,40 @@ growBtn.onclick = async () => {
     const cond = condFrom(osm.roads, osm.built, elev);
     const sess = await getSession();
     const bounds = windowBounds(pick.lat, pick.lng);
-    const cnv = document.createElement("canvas"); cnv.width = G; cnv.height = G;
+    /* draw at 4x with hard-edged cells; roads get a 1px pad so 1-px lines
+       stay continuous instead of dissolving into dashes when Leaflet
+       stretches the image over the basemap */
+    const S = 4;
+    const cnv = document.createElement("canvas");
+    cnv.width = G * S; cnv.height = G * S;
     const ctx = cnv.getContext("2d");
-    const im = ctx.createImageData(G, G);
-    const paint = (i, r, g, b, a) => { im.data[4*i]=r; im.data[4*i+1]=g;
-                                       im.data[4*i+2]=b; im.data[4*i+3]=a; };
+    const cell = (i, color, pad = 0) => {
+      ctx.fillStyle = color;
+      ctx.fillRect((i % G) * S - pad, Math.floor(i / G) * S - pad,
+                   S + 2 * pad, S + 2 * pad);
+    };
     if (!sess) {
-      for (let i = 0; i < G*G; i++) {
-        if (osm.roads[i]) paint(i, 20, 20, 20, 210);
-        else if (osm.built[i]) paint(i, 120, 120, 120, 170);
-      }
+      for (let i = 0; i < G*G; i++)
+        if (osm.built[i] && !osm.roads[i]) cell(i, "rgba(120,120,120,0.62)");
+      for (let i = 0; i < G*G; i++)
+        if (osm.roads[i]) cell(i, "rgba(20,20,20,0.78)", 1);
       statusReal.textContent = "no model weights yet: overlay shows the parsed existing town";
     } else {
       const x = await runDDIM(sess, cond, statusReal);
       const n = G*G;
       for (let i = 0; i < n; i++) {
-        const newRoad = x[i] > 0 && !osm.roads[i];
         const dNew = Math.max(0, Math.min(1, (x[n+i]+1)/2));
-        if (osm.roads[i]) paint(i, 20, 20, 20, 190);
-        else if (newRoad) paint(i, 208, 95, 78, 230);
-        else if (dNew > 0.12 && !osm.built[i]) paint(i, 242, 182, 96, 190);
-        else if (osm.built[i]) paint(i, 120, 120, 120, 150);
+        if (osm.built[i] && !osm.roads[i]) cell(i, "rgba(120,120,120,0.55)");
+        else if (dNew > 0.12 && !osm.roads[i]) cell(i, "rgba(242,182,96,0.72)");
       }
+      for (let i = 0; i < n; i++)
+        if (x[i] > 0 && !osm.roads[i]) cell(i, "rgba(208,95,78,0.88)", 1);
+      for (let i = 0; i < n; i++)
+        if (osm.roads[i]) cell(i, "rgba(20,20,20,0.72)", 1);
       statusReal.textContent = "done. orange is generated growth, red-brown is new roads";
     }
-    ctx.putImageData(im, 0, 0);
-    const ov = L.imageOverlay(cnv.toDataURL(), bounds, { opacity: 0.85 }).addTo(map);
+    const ov = L.imageOverlay(cnv.toDataURL(), bounds,
+      { opacity: 0.9, className: "crisp" }).addTo(map);
     overlays.push(ov);
     map.fitBounds(bounds);
   } catch (err) {
