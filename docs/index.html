@@ -392,10 +392,17 @@ function addAmenityBump(a, mask) { // gaussian bump at region centroid, sigma G/
 }
 /*ENDPURE*/
 
-/* JS port of src/zones.py feature_stack. COMPROMISE: f4 (amenity field)
-   should be the existing OSM amenity density plus the proposed one; in the
-   browser only the decoded model channel 2 exists (existing + proposed
-   mixed by the model), so that channel is used directly. */
+/* JS port of src/zones.py feature_stack. f4 must match training: SPARSE
+   log-scaled OSM amenity-POINT density (zero almost everywhere). Feeding
+   the model's diffuse channel 2 here inflates institutional/commercial.
+   Map mode passes real OSM POI density; sandbox passes sparseAmen(ch2). */
+function sparseAmen(a) {   // knock out the diffuse baseline, keep the peaks
+  const n=a.length, s=Float64Array.from(a).sort(), med=s[n>>1];
+  const out=new Float64Array(n); let mx=0;
+  for (let i=0;i<n;i++){ out[i]=Math.max(0,a[i]-med); if(out[i]>mx)mx=out[i]; }
+  if (mx>0) for (let i=0;i<n;i++) out[i]/=mx;
+  return out;
+}
 function zoneFeatureFields(elev, roads, dens, amen) {
   const n=G*G, half=G/2;
   const f0=new Float64Array(n), f1=new Float64Array(n);
@@ -538,7 +545,7 @@ async function generate() {
       const mask = new Uint8Array(n);
       for (let i=0;i<n;i++)
         if (newDens[i]>0.25 && !built[i] && !roads[i] && !parks[i]) mask[i]=1;
-      zones = classifyGrowth(clf, elev, roads, newDens, amen, mask, null);
+      zones = classifyGrowth(clf, elev, roads, newDens, sparseAmen(amen), mask, null);
     }
     renderOut(elev, roads, built, parks, {newRoads, newDens}, amen, zones);
     statusEl.textContent = (zones
@@ -649,11 +656,19 @@ async function fetchElevReal(lat, lon) {
   return elev;
 }
 
+const AMEN_TAGS = "school|hospital|university|college|townhall|community_centre" +
+  "|library|clinic|restaurant|cafe|pharmacy|bank|marketplace|kindergarten" +
+  "|doctors|post_office";                 // mirrors data_v3 POI vocabulary
+const AMEN_SET = new Set(AMEN_TAGS.split("|"));
+
 async function fetchOSMReal(lat, lon) {
   const b = windowBounds(lat, lon);
-  const q = `[out:json][timeout:60];(way(${b[0][0]},${b[0][1]},${b[1][0]},${b[1][1]})` +
+  const bb = `${b[0][0]},${b[0][1]},${b[1][0]},${b[1][1]}`;
+  const q = `[out:json][timeout:60];(way(${bb})` +
     `["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|unclassified|living_street|service)"];` +
-    `way(${b[0][0]},${b[0][1]},${b[1][0]},${b[1][1]})["building"];);out geom;`;
+    `way(${bb})["building"];` +
+    `node(${bb})["amenity"~"^(${AMEN_TAGS})$"];node(${bb})["shop"];` +
+    `way(${bb})["amenity"~"^(${AMEN_TAGS})$"];way(${bb})["shop"];);out geom;`;
   const r = await fetch("https://overpass-api.de/api/interpreter",
     { method: "POST", body: "data=" + encodeURIComponent(q) });
   const js = await r.json();
@@ -663,13 +678,33 @@ async function fetchOSMReal(lat, lon) {
   const [s, w] = b[0], [nn, e] = b[1];
   const toPx = (g) => [ (g.lon - w) / (e - w) * (G - 1),
                         (nn - g.lat) / (nn - s) * (G - 1) ];
+  const counts = new Float64Array(G * G);
+  const addPt = (la, lo) => {
+    const p = toPx({ lat: la, lon: lo });
+    const xi = Math.round(p[0]), yi = Math.round(p[1]);
+    if (xi >= 0 && xi < G && yi >= 0 && yi < G) counts[yi * G + xi] += 1;
+  };
   for (const el of js.elements || []) {
+    const t = el.tags || {};
+    const poi = ("shop" in t) || AMEN_SET.has(t.amenity);
+    if (el.type === "node") { if (poi) addPt(el.lat, el.lon); continue; }
     if (el.type !== "way" || !el.geometry) continue;
-    const pts = el.geometry.map(toPx);
-    ctx.beginPath();
-    pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
-    if (el.tags && el.tags.building) { ctx.closePath(); ctx.fillStyle = "#c85a3c"; ctx.fill(); }
-    else { ctx.strokeStyle = "#141414"; ctx.lineWidth = 1.2; ctx.stroke(); }
+    if (poi) {                              // way POI: centroid
+      let sa = 0, so = 0;
+      for (const g of el.geometry) { sa += g.lat; so += g.lon; }
+      addPt(sa / el.geometry.length, so / el.geometry.length);
+    }
+    if (t.building) {
+      const pts = el.geometry.map(toPx);
+      ctx.beginPath();
+      pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+      ctx.closePath(); ctx.fillStyle = "#c85a3c"; ctx.fill();
+    } else if (t.highway) {
+      const pts = el.geometry.map(toPx);
+      ctx.beginPath();
+      pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+      ctx.strokeStyle = "#141414"; ctx.lineWidth = 1.2; ctx.stroke();
+    }
   }
   const d = ctx.getImageData(0, 0, G, G).data;
   const roads = new Uint8Array(G * G), built = new Uint8Array(G * G);
@@ -679,7 +714,16 @@ async function fetchOSMReal(lat, lon) {
     if (lum < 70) roads[i] = 1;
     else if (r0 > g0 && Math.max(r0,g0,b0)-Math.min(r0,g0,b0) > 60) built[i] = 1;
   }
-  return { roads, built };
+  /* real amenity density, exactly like data_v3.amenity_density:
+     counts -> box blur r=4 -> log1p -> normalize to max 1 */
+  const amenReal = boxBlur(counts, 4);
+  let mx = 0;
+  for (let i = 0; i < G * G; i++) {
+    amenReal[i] = Math.log1p(amenReal[i]);
+    if (amenReal[i] > mx) mx = amenReal[i];
+  }
+  if (mx > 0) for (let i = 0; i < G * G; i++) amenReal[i] /= mx;
+  return { roads, built, amenReal };
 }
 
 let lastReal = null;   // {x, osm, elev, cond, bounds, amen, biases} from last grow
@@ -714,7 +758,8 @@ async function paintReal() {
     /* roads feature: model roads are hidden as unreliable, so zoning sees
        only the existing OSM network (pipeline uses existing+generated) */
     const zones = clf
-      ? classifyGrowth(clf, elev, osm.roads, dNew, amen, mask, biases) : null;
+      ? classifyGrowth(clf, elev, osm.roads, dNew,
+                       osm.amenReal || sparseAmen(amen), mask, biases) : null;
     typed = !!zones;
     const zc = {1:"rgba(242,209,107,0.8)", 2:"rgba(224,101,95,0.8)",
                 3:"rgba(165,139,196,0.8)", 4:"rgba(111,168,220,0.8)"};
