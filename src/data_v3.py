@@ -1,6 +1,7 @@
-"""v3 data: typed zones + a generated amenity-density channel.
+"""v3/v4 data: typed zones, a generated amenity-density channel, and (v4)
+a water conditioning channel.
 
-Extends the v2 GHSL temporal pairs in two ways:
+Extends the v2 GHSL temporal pairs in three ways:
 
   1. The diffusion target gains a third channel: log-scaled amenity density
      (shops, schools, clinics, cafes...) rasterized from OSM points. The
@@ -16,8 +17,17 @@ Extends the v2 GHSL temporal pairs in two ways:
      zone classifier. Labels are patchy outside Europe, which is exactly
      why zoning is a masked post-hoc stage and not a diffusion output yet.
 
-cond stays 4 channels, so the v2-trained model is unaffected; train.py
-infers out_ch=3 from this dataset automatically.
+  3. (v4) A filled OSM water mask becomes conditioning channel 5 (channels
+     0-3 unchanged, so anything trained on the v3 cond layout -- e.g. the
+     router's conditioning stats in moe.py -- keeps meaning). Without this,
+     a flat lake reads to the model exactly like a flat buildable valley
+     floor, since nothing else in cond distinguishes them. Training targets
+     are also forced to no-growth on water: real lakes don't get infilled,
+     so the diffusion target shouldn't teach the model otherwise.
+
+cond is 4 channels for v3 callers (zones.py's post-hoc classifier only
+looks at physical features, not water) and 5 for v4 datasets built here;
+train.py infers cond_ch from whatever build_dataset_v3 wrote.
 """
 
 import os
@@ -45,13 +55,17 @@ V3_FILTERS = (
     f'amenity~"^({"|".join(_INSTITUTIONAL)})$"',
     f'amenity~"^({"|".join(_AMENITY_POINTS)})$"',
     'shop~"."',
+    'natural~"^water$"',
+    'waterway~"^riverbank$"',
+    'landuse~"^(reservoir|basin)$"',
 )
 
 AMENITY_BLUR_PX = 4   # ~60 m smoothing radius for the density channel
 
 
 def fetch_env_v3(lat, lon, session=None):
-    """One Overpass query per town: landuse polygons + amenity/shop POIs."""
+    """One Overpass query per town: landuse polygons + amenity/shop POIs
+    + water polygons (lakes, reservoirs, river banks)."""
     return _fetch(lat, lon, V3_FILTERS, session)
 
 
@@ -80,6 +94,29 @@ def zone_raster(osm_json, lat, lon):
                 and "geometry" in el):
             draw(el, 4)
     return np.asarray(im, dtype=np.uint8)
+
+
+def water_raster(osm_json, lat, lon):
+    """GRID x GRID float32 mask in {0, 1}: filled lakes/reservoirs/river
+    banks from OSM polygons. This is v4 conditioning channel 5 -- see the
+    module docstring for why it exists (a flat lake otherwise looks like a
+    flat buildable valley floor to the model)."""
+    bbox = window_bbox(lat, lon)
+    im = Image.new("L", (GRID, GRID), 0)
+    dr = ImageDraw.Draw(im)
+    for el in osm_json.get("elements", []):
+        if el.get("type") != "way" or "geometry" not in el:
+            continue
+        tags = el.get("tags", {})
+        is_water = (tags.get("natural") == "water"
+                   or tags.get("waterway") == "riverbank"
+                   or tags.get("landuse") in ("reservoir", "basin"))
+        if not is_water:
+            continue
+        pts = [lonlat_to_px(g["lon"], g["lat"], bbox) for g in el["geometry"]]
+        if len(pts) >= 3:
+            dr.polygon(pts, fill=1)
+    return np.asarray(im, dtype=np.float32)
 
 
 def _box_blur(a, r):
@@ -115,21 +152,36 @@ def amenity_density(osm_json, lat, lon, blur_px=AMENITY_BLUR_PX):
     return (dens / m if m > 0 else dens).astype(np.float32)
 
 
-def make_sample_v3(elev, roads, d0, d1, amen):
-    """v2 sample plus the amenity channel: target [roads_new, d1, amenity]."""
+def make_sample_v3(elev, roads, d0, d1, amen, water=None):
+    """v2 sample plus the amenity target channel and, when `water` is
+    given (v4), a 5th water conditioning channel. Channels 0-3 of cond are
+    unchanged so the router's conditioning stats in moe.py keep meaning.
+    Training targets are forced to no-growth on water: a real lake never
+    gets infilled, so the diffusion target shouldn't teach otherwise."""
     s = make_sample_v2(elev, roads, d0, d1)
     if s is None:
         return None
     cond, target = s
+    if water is not None:
+        cond = np.concatenate([cond, water.astype(np.float32)[None]])
+        wet = water.astype(bool)
+        if wet.any():
+            target = target.copy()
+            target[0][wet] = -1.0                                  # no new roads on water
+            target[1][wet] = (d0.astype(np.float32) * 2.0 - 1.0)[wet]  # no growth on water
     amen_scaled = (amen.astype(np.float32) * 2.0 - 1.0)[None]
     return cond, np.concatenate([target, amen_scaled]).astype(np.float32)
 
 
 def build_dataset_v3(towns, out_path, cache_dir="ghsl_cache", verbose=True,
-                     workers=3, town_cache_dir="data/town_cache_v3"):
+                     workers=3, town_cache_dir="data/town_cache_v3",
+                     with_water=False):
     """Diffusion dataset with 3-channel targets, plus per-town aux caches
     (zone raster, amenity map, elev, roads, 2020 density) that zones.py
-    trains from. Resumable and parallel like the v2 builder."""
+    trains from. Pass with_water=True (v4) to append the water channel to
+    cond and force no-growth targets on water; town_cache_dir must be a
+    fresh directory when doing so -- v3 caches have no water channel and
+    must not be reused. Resumable and parallel like the v2 builder."""
     import threading
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import requests
@@ -137,6 +189,7 @@ def build_dataset_v3(towns, out_path, cache_dir="ghsl_cache", verbose=True,
     os.makedirs(town_cache_dir, exist_ok=True)
     tile_cache = {}
     overpass_sem = threading.Semaphore(1)
+    cond_ch = 5 if with_water else 4
 
     def worker(town):
         name, cc, lat, lon, _region = town
@@ -154,21 +207,24 @@ def build_dataset_v3(towns, out_path, cache_dir="ghsl_cache", verbose=True,
         roads, _ = rasterize_osm(osm, lat, lon)
         zones = zone_raster(env, lat, lon)
         amen = amenity_density(env, lat, lon)
+        water = water_raster(env, lat, lon) if with_water else None
         dens = {ep: sample_density(lat, lon, ep, cache_dir, session,
                                    tile_cache) for ep in EPOCHS}
         raw = []
         for e0, e1 in zip(EPOCHS[:-1], EPOCHS[1:]):
-            s = make_sample_v3(elev, roads, dens[e0], dens[e1], amen)
+            s = make_sample_v3(elev, roads, dens[e0], dens[e1], amen, water)
             if s is not None:
                 raw.append(s)
-        np.savez_compressed(
-            cache,
+        save_kwargs = dict(
             cond=np.stack([c for c, _ in raw]) if raw
-            else np.zeros((0, 4, GRID, GRID), np.float32),
+            else np.zeros((0, cond_ch, GRID, GRID), np.float32),
             target=np.stack([t for _, t in raw]) if raw
             else np.zeros((0, 3, GRID, GRID), np.float32),
             zones=zones, amenity=amen, elev=elev.astype(np.float32),
             roads=roads, dens2020=dens[2020].astype(np.float32))
+        if with_water:
+            save_kwargs["water"] = water
+        np.savez_compressed(cache, **save_kwargs)
         return raw, False
 
     conds, targets = [], []
