@@ -4,9 +4,24 @@ OSM landuse labels are patchy outside Europe and dominated by residential,
 so zone types are NOT a diffusion output yet (see ROADMAP, v3 typed
 zoning). Instead a per-pixel classifier is trained only where labels
 exist, on physical features the generator already produces, and then
-paints residential / commercial / industrial / institutional classes onto
-new development. Leave-one-town-out macro-F1 keeps the transfer claim
-testable, mirroring bikelanes.py.
+paints residential / commercial / industrial / institutional / mixed /
+farmland classes onto new development. Leave-one-town-out macro-F1 keeps
+the transfer claim testable, mirroring bikelanes.py.
+
+Class 5 ("mixed") is a labelling-side addition, not a new OSM tag: OSM has
+no first-class mixed-use landuse value at this raster scale (18 m/px),
+so a residential parcel next door to a corner shop is simply tagged
+"residential" and a live/work block over a retail strip is tagged
+"retail". The honest proxy available from the data we already have is
+proximity co-occurrence: pixels that are nominally residential but sit
+close to commercial/retail activity (and vice versa) behave like mixed-use
+frontage in practice, so they are relabelled class 5 before training.
+This only touches the boundary band between the two uses; a residential
+block with no commercial pixels within range is untouched. relabel_mixed_use
+only inspects classes 1 (residential) and 2 (commercial); class 6
+(farmland, data_v3.ZONE_NAMES) is a real OSM landuse tag, not a proximity
+proxy, so it is never relabelled and never triggers a relabel of its
+neighbours.
 
 Dependencies: numpy, scipy, scikit-learn.
 """
@@ -16,10 +31,50 @@ import os
 import numpy as np
 
 from data import GRID, slope_from_elevation
-from data_v3 import ZONE_NAMES, _box_blur
+from data_v3 import ZONE_NAMES as _ZONE_NAMES_V3, _box_blur
+
+# Class 5 is assigned post-hoc by relabel_mixed_use (proximity co-occurrence
+# of residential and commercial/retail), not present in the raw OSM raster.
+# Class 6 ("farmland") is inherited as-is from data_v3.ZONE_NAMES: it is a
+# real landuse tag, so it needs no post-hoc labelling step here.
+ZONE_NAMES = dict(_ZONE_NAMES_V3)
+ZONE_NAMES[5] = "mixed"
 
 MAX_PX_PER_CLASS = 400   # per town, to cap residential dominance
 N_FEATURES = 6
+MIXED_USE_CLASS = 5
+MIXED_USE_RADIUS = 3     # Chebyshev (square) radius for co-occurrence check
+
+
+def _chebyshev_dilate(mask, r):
+    """True where `mask` has a True pixel within Chebyshev radius r
+    (i.e. any pixel in the (2r+1)x(2r+1) square neighbourhood). Distinct
+    from data.binary_dilate, which dilates over a Euclidean disk."""
+    mask = np.asarray(mask, dtype=bool)
+    padded = np.pad(mask, r, mode="constant", constant_values=False)
+    out = np.zeros_like(mask)
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            out |= padded[r + dy:r + dy + mask.shape[0],
+                         r + dx:r + dx + mask.shape[1]]
+    return out
+
+
+def relabel_mixed_use(zones, radius=MIXED_USE_RADIUS):
+    """Relabel residential (1) pixels within Chebyshev `radius` of a
+    commercial/retail (2) pixel, and vice versa, as class 5 ("mixed").
+    Other classes (industrial=3, institutional=4) are left untouched.
+    Operates on a copy; returns a new array."""
+    out = zones.copy()
+    res_mask = zones == 1
+    com_mask = zones == 2
+    if not res_mask.any() or not com_mask.any():
+        return out
+    near_com = _chebyshev_dilate(com_mask, radius)
+    near_res = _chebyshev_dilate(res_mask, radius)
+    out[res_mask & near_com] = MIXED_USE_CLASS
+    out[com_mask & near_res] = MIXED_USE_CLASS
+    return out
 
 
 def feature_stack(elev, roads, dens, amen):
@@ -44,9 +99,13 @@ def feature_stack(elev, roads, dens, amen):
 
 
 def town_zone_data(town_npz, rng):
-    """(X, y) sampled from one town cache written by build_dataset_v3."""
+    """(X, y) sampled from one town cache written by build_dataset_v3.
+    Residential/commercial pixels within MIXED_USE_RADIUS of each other
+    are relabelled class 5 ("mixed") before sampling -- see module
+    docstring for why proximity co-occurrence is used as the mixed-use
+    proxy instead of an OSM tag."""
     d = np.load(town_npz, allow_pickle=True)
-    zones = d["zones"]
+    zones = relabel_mixed_use(d["zones"])
     feats = feature_stack(d["elev"], d["roads"], d["dens2020"], d["amenity"])
     X, y = [], []
     for cls in ZONE_NAMES:
@@ -95,18 +154,150 @@ def train_zone_classifier(town_cache_dir="data/town_cache_v3", verbose=True,
     return clf, float(np.mean(scores))
 
 
+def predict_with_margin(clf, X):
+    """(labels, margin) where margin = top raw score minus runner-up score.
+    Works for either HistGradientBoostingClassifier scoring interface:
+    decision_function for binary problems returns a 1-D array (no
+    runner-up, margin is just |score|), while the multiclass case and
+    predict_proba both return a (n_samples, n_classes) score matrix that
+    we can rank per-row. Falls back to predict_proba if decision_function
+    is unavailable."""
+    if len(X) == 0:
+        return (np.zeros(0, dtype=clf.classes_.dtype),
+                np.zeros(0, dtype=np.float64))
+    if hasattr(clf, "decision_function"):
+        scores = clf.decision_function(X)
+    else:
+        scores = clf.predict_proba(X)
+    scores = np.asarray(scores)
+    if scores.ndim == 1:
+        # binary decision_function: single margin-like score per sample
+        labels = clf.classes_[(scores > 0).astype(int)]
+        margin = np.abs(scores)
+        return labels, margin
+    order = np.argsort(scores, axis=1)
+    top_idx = order[:, -1]
+    runner_idx = order[:, -2] if scores.shape[1] > 1 else order[:, -1]
+    rows = np.arange(scores.shape[0])
+    top = scores[rows, top_idx]
+    runner = scores[rows, runner_idx]
+    labels = clf.classes_[top_idx]
+    margin = top - runner
+    return labels, margin
+
+
 def assign_zones(dens_new, roads_all, elev, amen, clf, d0=None,
-                 thr=0.05):
-    """Class raster over NEW development pixels (0 elsewhere)."""
-    from data import binary_dilate
-    new_dev = dens_new > thr
-    if d0 is not None:
-        foot0 = binary_dilate((d0 > thr).astype(np.uint8), 2).astype(bool)
-        new_dev = new_dev & ~foot0
+                 thr=0.05, min_margin=0.0, min_context=0.0):
+    """Class raster over NEW development pixels (0 elsewhere).
+
+    min_margin / min_context implement abstention: a pixel whose
+    classifier margin (predict_with_margin) is below min_margin, OR whose
+    local density context (box-blurred dens_new, radius 4, i.e. feature
+    f3 already computed in feature_stack) is below min_context, is left
+    class 0 ("untyped") instead of being forced into one of the trained
+    classes. Defaults (0.0, 0.0) keep the old always-assign behaviour
+    since margins and context are always >= 0.
+
+    new_dev now comes from data.built_mask (thresh + despeckle), the same
+    helper render.py uses, so a 1-2 px density blip can't get a zone
+    colour painted on the map that the plan renderer would never show."""
+    from data import built_mask
+    new_dev = built_mask(dens_new, thr=thr, d0=d0)
     out = np.zeros((GRID, GRID), dtype=np.uint8)
     ys, xs = np.nonzero(new_dev)
     if len(ys) == 0:
         return out
     feats = feature_stack(elev, roads_all, dens_new, amen)
-    out[ys, xs] = clf.predict(feats[ys, xs]).astype(np.uint8)
+    X = feats[ys, xs]
+    labels, margin = predict_with_margin(clf, X)
+    context = X[:, 3]   # local_dens, same box-blur(dens, 4) feature_stack builds
+    keep = np.ones(len(ys), dtype=bool)
+    if min_margin > 0.0:
+        keep &= margin >= min_margin
+    if min_context > 0.0:
+        keep &= context >= min_context
+    assigned = np.zeros(len(ys), dtype=np.uint8)
+    assigned[keep] = labels[keep].astype(np.uint8)
+    out[ys, xs] = assigned
     return out
+
+
+def zone_potential(d0, roads_now, elev, amen, clf, ring_px=8,
+                   exclude=None, min_margin=0.0):
+    """Advisory zoning over land that COULD develop next, before any model
+    sample commits growth there. Candidates are the undeveloped ring within
+    ring_px (Chebyshev) of the current footprint, minus roads and any
+    exclude mask (water, steep slopes, protected land). Each candidate is
+    typed with the same features and classifier used for generated growth;
+    margins below min_margin abstain to class 0. This answers a different
+    question than assign_zones: not "what did the model build and what is
+    it", but "if this parcel develops, what use fits its context". Pairing
+    it with the generated-density map gives a planner both where expansion
+    is likely and what to put there."""
+    foot = d0 > 0.05
+    ring = _chebyshev_dilate(foot, ring_px) & ~_chebyshev_dilate(foot, 1)
+    cand = ring & ~roads_now.astype(bool)
+    if exclude is not None:
+        cand &= ~np.asarray(exclude, dtype=bool)
+    out = np.zeros((GRID, GRID), dtype=np.uint8)
+    ys, xs = np.nonzero(cand)
+    if len(ys) == 0:
+        return out
+    feats = feature_stack(elev, roads_now, d0, amen)
+    labels, margin = predict_with_margin(clf, feats[ys, xs])
+    keep = margin >= min_margin if min_margin > 0.0 \
+        else np.ones(len(ys), dtype=bool)
+    lab = np.zeros(len(ys), dtype=np.uint8)
+    lab[keep] = labels[keep].astype(np.uint8)
+    out[ys, xs] = lab
+    return out
+
+
+def _self_test():
+    """numpy-only sanity check for relabel_mixed_use: a residential block
+    adjacent to a commercial strip should get a class-5 boundary band,
+    an isolated residential block far away stays class 1, and farmland
+    (class 6) right next to the same commercial strip is never relabelled
+    (relabel_mixed_use only inspects classes 1 and 2)."""
+    zones = np.zeros((40, 40), dtype=np.uint8)
+    zones[5:15, 5:15] = 1                  # residential block A
+    zones[5:15, 16:20] = 2                 # commercial strip, touching A
+    zones[30:36, 30:36] = 1                # isolated residential block B
+    zones[5:15, 21:26] = 6                 # farmland, touching the same strip
+
+    out = relabel_mixed_use(zones, radius=MIXED_USE_RADIUS)
+
+    # Farmland touching the commercial strip must stay class 6: proximity
+    # co-occurrence only applies to the 1<->2 pair, never to class 6.
+    assert np.all(out[5:15, 21:26] == 6), \
+        "farmland adjacent to commercial must not be relabelled mixed"
+
+    # Block A: pixels near the residential/commercial boundary become 5.
+    assert out[9, 14] == MIXED_USE_CLASS, \
+        "residential pixel adjacent to commercial should become mixed"
+    assert out[9, 17] == MIXED_USE_CLASS, \
+        "commercial pixel adjacent to residential should become mixed"
+    # Far corner of block A (row 5, col 5) is > radius=3 Chebyshev cells
+    # from the commercial strip (nearest commercial col is 16), so it
+    # should remain plain residential.
+    assert out[5, 5] == 1, \
+        "residential pixel far from commercial should stay residential"
+
+    # Isolated block B has no class-2 pixels anywhere nearby -> untouched.
+    assert np.all(out[30:36, 30:36] == 1), \
+        "isolated residential block should stay class 1 (no mixed pixels)"
+    assert not np.any(out == MIXED_USE_CLASS) or \
+        np.any(out[5:15, 12:20] == MIXED_USE_CLASS), \
+        "mixed-use band should appear only near the residential/commercial edge"
+
+    n_mixed = int(np.sum(out == MIXED_USE_CLASS))
+    n_res = int(np.sum(zones == 1))
+    assert 0 < n_mixed < n_res, \
+        "mixed relabelling should touch some but not all residential pixels"
+
+    print(f"relabel_mixed_use self-test OK: {n_mixed} px relabelled mixed, "
+          f"isolated block untouched, far corner stays residential.")
+
+
+if __name__ == "__main__":
+    _self_test()
