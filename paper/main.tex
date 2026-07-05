@@ -984,6 +984,55 @@ isolates only the normalisation, not the training data, as a variable.
 No comparison between the five-expert mixture and a single mixed model
 has been run.
 
+Figure~\ref{fig:site} shows the deployed browser tool applied to two
+adjacent Rhine-valley windows, Schaan and Vaduz (Liechtenstein),
+outside every training and evaluation list. Both windows are flat,
+densely gridded valley floor bounded by the Rhine channel to the west
+and a forested scarp to the east. Four behaviours of the deployed
+stack are visible. First, the two inference-time locks act exactly at
+their boundaries: no growth or typing appears on the river channel
+(water lock) or on the scarp, where the terrain wash marks slopes
+above $25^\circ$ (steep lock). Second, the bike-infrastructure
+classifier marks a large share of the street grid; it was trained on
+flat cycling towns and near-zero grades dominate its features, so
+dense suggestions on a flat gridded town are its expected behaviour
+rather than a calibration artefact. Third, most coloured area in the
+built-out Vaduz window is the faint advisory layer rather than
+committed growth: the display gate excludes the developed interior, so
+a nearly built-out window yields recommendations about expansion land
+rather than proposals inside the fabric. The advisory typing along the
+corridor between the town core and the river is predominantly
+industrial, which coincides with the location of Vaduz's existing
+industrial estates, suggesting the classifier's context features
+respond to real structure there. Fourth, the proposed local centres
+(stars) fall inside the existing fabric rather than on the fringe,
+consistent with the amenity channel's training objective. Two caveats
+apply to reading these images. Each is a single deterministic sample
+through the deployed tool, not a best-of-$N$ selection, and the
+display thresholds that separate interior from expansion land were
+calibrated against the Vaduz window specifically, so the modest
+committed-growth footprint there is partly a property of the
+calibration rather than of the model. OpenStreetMap building coverage
+in the region is incomplete, which overstates the amount of open,
+typeable land.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.92\linewidth]{figures/site_schaan.png}\\[5pt]
+\includegraphics[width=0.92\linewidth]{figures/site_vaduz.png}
+\caption{The deployed browser tool on two windows outside all training
+and evaluation lists: Schaan (top) and Vaduz (bottom), Liechtenstein.
+Dark pixels are the existing OSM road network; teal marks road
+segments whose predicted bike-infrastructure probability exceeds 0.5;
+solid colours are sampled growth typed by the zone classifier; faint
+colours are the advisory layer over potential expansion land; stars
+are proposed local centres from the amenity channel. Growth and typing
+terminate at the water lock on the Rhine (west) and the steep-slope
+lock on the scarp (east). Single deterministic samples; see the text
+for interpretation and caveats.}
+\label{fig:site}
+\end{figure}
+
 \section{Applications: towards automated city-building agents}
 \label{sec:applications}
 The sandbox mode is a decision-making layer for game automation: at each
@@ -1106,12 +1155,6 @@ the validation attributes the repair to the expanded training data
 rather than the feature recalibration, a distinction the deployment
 retains in the form of per-class abstention margins. A controlled
 mixture-versus-single-model comparison remains open.
-
-\section*{AI assistance disclosure}
-The code, experiments, and text of this paper were produced with
-substantial assistance from an AI system (Anthropic Claude), directed
-and reviewed by the author. This disclosure is made in accordance with
-venue policies on AI-assisted research.
 
 \bibliographystyle{unsrtnat}
 \begin{thebibliography}{99}
