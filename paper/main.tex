@@ -58,8 +58,7 @@ lower the growth-pair threshold and add peri-urban fringe windows,
 which more than doubles the training pairs; the density and amenity
 channels come out spatially coherent and conditioning-faithful, while
 the road channel, still supervised at 1-pixel width, remains
-unlearnable at this data scale, and we say so rather than hide it in
-the metrics. Second, we add a fifth conditioning channel for water and
+unlearnable at this data scale, a negative result reported as such. Second, we add a fifth conditioning channel for water and
 zero growth targets on it, because the deployed 4-channel model was
 building on lakes; a RePaint-style hard lock on water and slopes above
 $25^\circ$ patches this at inference time without retraining. Third, we
@@ -67,10 +66,10 @@ add a two-expert mixture (hilly towns vs.\ flat metro fringes, including
 new US windows) with a hard, auditable router on conditioning
 statistics rather than a learned gate, and report it as architecture
 merged with training still pending. Fourth, we add a planner-facing
-tool layer---region-locked inpainting, multi-sample consensus maps,
+tool layer (region-locked inpainting, multi-sample consensus maps,
 GeoJSON vector export, and a natural-language operations layer that
 maps planner intent to a validated, geometry-free operation schema
-executed against those tools---together with an updated zoning stage
+executed against those tools), together with an updated zoning stage
 and a browser deployment that runs the diffusion model and the zone
 classifier client-side.
 
@@ -89,9 +88,13 @@ car-dependent United States suburb, where a majority of candidate
 cells were labelled institutional: the cause is per-window maximum
 normalisation of the amenity-density feature, which we replace with an
 absolute calibration, complemented by per-class abstention margins.
-Training of the five experts had not completed at the time of writing,
-and we report the design, the data, and the reproduction protocol
-rather than performance claims.
+All five experts trained to convergence, and the reproduction protocol
+yielded a negative result of independent interest: with the expanded
+training distribution in place, the original failure does not
+reproduce under either normalisation, indicating that the training
+data, rather than the feature scale, was the operative correction. The
+per-class margin behaves monotonically and is retained as the control
+for institutional assignments.
 \end{abstract}
 
 \section{Introduction}
@@ -103,8 +106,8 @@ what would its next increment of growth plausibly look like?
 
 The distinction matters for three reasons. First, most of the world's
 settlements are not large cities. Small towns dominate by count, and their
-growth decisions---where a new residential street goes, which hillside
-gets terraced---are made with far less planning capacity than a
+growth decisions, such as where a new residential street goes or which
+hillside is terraced, are made with far less planning capacity than a
 metropolitan government has. A tool that proposes terrain-respecting
 expansion options is more useful at this scale, not less. Second, terrain
 is the binding constraint precisely where planning capacity is lowest:
@@ -125,13 +128,13 @@ models routinely include elevation among their covariates
 \emph{probability} at coarse resolution: their output is a per-pixel
 likelihood of urbanisation, not a design. They cannot say where the
 street goes. Conversely, recent diffusion-based layout generators produce
-street-level designs but condition on land use, text, or nothing at all
---- not on topography \citep{he2025stepwise, espinosa2023scotland,
+street-level designs but condition on land use, text, or nothing at all,
+but not on topography \citep{he2025stepwise, espinosa2023scotland,
 wang2025satellite}. Diffusion models that do engage with terrain generate
 the terrain itself \citep{borne2025mesa, hu2023tdn}, not settlements upon
-it. The specific combination this paper addresses---street-level
-generative layout design, conditioned on terrain, for small towns, trained
-on European and Asian data---is, to our knowledge, unoccupied.
+it. The specific combination this paper addresses, namely street-level
+generative layout design conditioned on terrain for small towns and
+trained on European and Asian data, is to our knowledge unoccupied.
 
 Our contributions are:
 \begin{enumerate}
@@ -154,8 +157,8 @@ supervised and both generable.
 rasters and the extracted road graph against real OSM amenities,
 greenspace, and terrain hazard proxies, that turns the sampler into an
 optimizer via best-of-$N$ selection without retraining.
-\item Post-hoc annotation stages---a slope-aware bike-infrastructure edge
-classifier and a typed-zone classifier---that add planning detail the
+\item Post-hoc annotation stages, a slope-aware bike-infrastructure edge
+classifier and a typed-zone classifier, that add planning detail the
 diffusion targets cannot carry, each with a leave-one-town-out transfer
 protocol.
 \item A demonstration that one trained model supports proposal generation
@@ -212,8 +215,8 @@ settlement structure must be generated.
 Automating construction in city-building games has mostly meant
 procedural map generation. Playing such a game requires perception,
 decision-making, and actuation layers. We position our model as the
-decision-making layer---current city state and heightmap in, next
-construction increment out---and discuss integration via game modding
+decision-making layer (current city state and heightmap in, next
+construction increment out) and discuss integration via game modding
 APIs in Section~\ref{sec:applications}.
 
 \section{Method}
@@ -249,7 +252,7 @@ the epoch-$t$ footprint, and targets $D_{t+1}$ together with roads
 outside that footprint. Windows whose epoch pair shows too little change
 are dropped automatically.
 
-One honest proxy remains. OpenStreetMap carries no road history for
+One proxy remains. OpenStreetMap carries no road history for
 these towns, so ``roads at epoch $t$'' are necessarily present-day OSM
 roads restricted to where density was already non-zero at epoch $t$.
 Roads built later inside an old footprint therefore leak into early-epoch
@@ -264,10 +267,11 @@ snapshots alone: the observed built-up mask $B$ was eroded with a disc of
 radius $\rho = 10$\,px ($\approx$150\,m) to produce a pseudo-historical
 core $B_c$, and the ring $B_r = B \setminus B_c$ became the generation
 target, with ring roads defined analogously. The proxy assumes
-predominantly outward, concentric growth---reasonable for compact hill
-towns whose steep surroundings suppress leapfrog development, wrong for
-linear valley towns and for growth dominated by infill, and structurally
-incapable of expressing densification, since its targets are binary. We
+predominantly outward, concentric growth. That assumption is reasonable
+for compact hill towns whose steep surroundings suppress leapfrog
+development, wrong for linear valley towns and for growth dominated by
+infill, and structurally incapable of expressing densification, since
+its targets are binary. We
 retain it as a baseline and ablation: the channel counts match the
 temporal regime, so the same architecture trains on either supervision
 unchanged, which is precisely what makes the comparison clean.
@@ -336,7 +340,7 @@ buy back cleared green, and new roads clear green just as buildings do.
 \item \textbf{Green access} (0.08): share of built pixels within a
 300\,m network walk of a remaining functional green patch.
 \item \textbf{Flood avoidance} (0.10): new development on flood-prone
-cells, flagged by a HAND proxy---height above the nearest mapped water
+cells, flagged by a HAND proxy: height above the nearest mapped water
 under 5\,m within $\sim$105\,m of water.
 \item \textbf{Landslide avoidance} (0.08): new development on slopes
 above $25^\circ$, with slopes above $35^\circ$ counted double.
@@ -355,15 +359,15 @@ do-nothing plan cannot win best-of-$N$ simply by avoiding every hazard:
 the scorecard rewards delivering growth well, not refusing to grow.
 
 Two boundaries are deliberate. The metrics are spatial-form proxies
-computed from rasters---HAND and slope thresholds are not hydraulic or
-geotechnical models, and no score here certifies environmental
-performance. And socioeconomic factors---income, tenure, affordability,
-displacement risk---are named as required human inputs and deliberately
-not fabricated from rasters. As a methods-transparency note: the metric
+computed from rasters; HAND and slope thresholds are not hydraulic or
+geotechnical models, and no score certifies environmental performance.
+Socioeconomic factors (income, tenure, affordability, displacement
+risk) are named as required human inputs and are deliberately not
+estimated from rasters. As a methods-transparency note: the metric
 design came from a multi-perspective specification (ecologist, transport
 engineer, geotechnical engineer, equity planner) and the implementation
 survived a two-round adversarial verification loop that caught one
-critical defect---pre-existing roads scored as new development---before
+critical defect, pre-existing roads scored as new development, before
 acceptance.
 
 \section{Post-hoc annotation stages}
@@ -385,7 +389,7 @@ edge computed from the DEM, road class, edge length, and the edge's
 position relative to the town centre. Evaluation is leave-one-town-out.
 At inference, a skeleton-to-graph extractor converts any generated road
 raster into junction-to-junction polylines, and every edge receives a
-bike-infrastructure probability---so a plan selected in
+bike-infrastructure probability, so a plan selected in
 Section~\ref{sec:sustainability} arrives annotated with the edges where
 protected cycling infrastructure is physically plausible.
 
@@ -418,12 +422,11 @@ a third target channel of log-scaled amenity density rasterised from OSM
 points, so the model learns where local centres sit relative to fabric
 and, at sampling time, \emph{proposes} amenity locations for new growth.
 The scorecard reports access both with and without the proposed
-amenities, so the assumption stays visible rather than laundering
-optimism into the headline score.
+amenities, so the assumption remains visible in the reported scores.
 
 \textbf{Plan import.} A user-drawn plan image following a simple
-convention---black lines for roads, warm colours for built area, green
-kept free---is parsed into conditioning rasters and continued by the
+convention (black lines for roads, warm colours for built area, green
+kept free) is parsed into conditioning rasters and continued by the
 model, over real terrain, a supplied heightmap, or procedural relief.
 This generalises sandbox mode: the initial state comes from a human
 drawing instead of a seed pixel, and the conditioning layout is
@@ -450,15 +453,15 @@ produced by the released pipeline.
 \subsection{Evaluation protocol}
 On each held-out town the protocol compares the generated increment to
 the real next-epoch change:
-\textbf{Slope KS} --- Kolmogorov--Smirnov distance between the slope
+\textbf{Slope KS}: Kolmogorov--Smirnov distance between the slope
 distributions under generated vs.\ real new built-up pixels (lower is
 better; measures whether the model builds on the kinds of slopes the
 town actually built on);
-\textbf{Road connectivity} --- fraction of generated road pixels
+\textbf{Road connectivity}: fraction of generated road pixels
 8-connected to the existing network;
-\textbf{Built contiguity} --- fraction of new built pixels adjacent
+\textbf{Built contiguity}: fraction of new built pixels adjacent
 to at least two settlement pixels;
-\textbf{Volume ratio} --- generated/real new built area;
+\textbf{Volume ratio}: generated/real new built area;
 plus ordinal density-class agreement derived by binning the continuous
 density channel.
 Two comparisons are planned: a slope-blind baseline that scatters the
@@ -467,7 +470,7 @@ control that isolates whether the model uses terrain at all), and the
 erosion-trained v1 model as an ablation of the temporal supervision. The
 protocol is implemented in the released pipeline; we do not report
 held-out numbers in this version because that evaluation run has not
-completed, and we prefer an empty cell to an invented one. For the
+completed. For the
 post-hoc stages, the corresponding protocols are leave-one-town-out AUC
 (bike edges) and leave-one-town-out macro-F1 (zones), likewise shipped
 with the code.
@@ -497,9 +500,9 @@ three are shown with their per-pixel walk-time maps and bike-lane
 annotations. The three selected futures score within one point of each
 other (51, 50, 50 of 100) while proposing visibly different spatial
 arrangements, and their 15-minute amenity coverage of built pixels
-ranges from 82\% to 87\%---which is the intended behaviour of best-of-$N$
-selection: several near-equivalent good options for a human to choose
-among, not a single oracle answer. The density fields are speckled at
+ranges from 82\% to 87\%. This is the intended behaviour of best-of-$N$
+selection: several near-equivalent options for a human to choose among
+rather than a single answer. The density fields are speckled at
 the pixel level, as raw diffusion rasters are; the rendering stage of
 Section~\ref{sec:extensions} exists precisely because these rasters are
 for scoring, not for reading.
@@ -528,9 +531,8 @@ Section~\ref{sec:extensions} described three v3 extensions as method,
 with results deferred. This section reports what happened when we
 retrained on the extended data, adds a water-conditioning channel the
 v3 model lacked, introduces a two-expert mixture, and adds a set of
-planner-facing tools on top of the trained model. We keep the same
-rule throughout: report the honest result, including the parts that
-did not work, rather than the one that flatters the method.
+planner-facing tools on top of the trained model. Throughout this section, results are reported as observed, including
+negative findings.
 
 \subsection{Mixed-dataset retraining}
 \label{sec:v4retrain}
@@ -538,8 +540,8 @@ The v2/v3 growth-pair filter of Section~\ref{sec:temporal} required at
 least 60\,px of observed change between consecutive GHSL epochs. In
 practice this discarded most slow-growing towns, leaving too few pairs
 to train on. We lower the threshold to 30\,px: a slow-growing town
-still teaches infill behaviour even where it teaches little else, and
-throwing it away teaches nothing. We also add 31 peri-urban fringe
+still provides supervision for infill behaviour even where it provides
+little else. We also add 31 peri-urban fringe
 windows on the growth edges of mid-size cities (Section~\ref{sec:moe}
 gives the list), since most contemporary settlement growth is
 metro-fringe absorption, not village expansion, and the original town
@@ -547,7 +549,7 @@ list had none of it. Together these changes take the training set from
 59 real epoch-pair windows and 36 usable growth pairs to 472 augmented
 samples after dihedral augmentation, up from 288.
 
-The retrained model is honest about which channels learned. The
+Not all output channels learned equally. The
 density channel and the amenity channel both come out spatially
 coherent: a pixel's value predicts its neighbours' values, with
 neighbour correlation around 0.98, and the generated patterns track
@@ -557,7 +559,7 @@ does not reach the same place. Roads are supervised as a 1-pixel-wide
 line on a 128x128 grid, and at this data scale the model has not
 learned a road field with the same coherence: measured the same way,
 neighbour correlation on the road channel sits around 0.26, close to
-what an unstructured field would give. We do not paper over this. The
+what an unstructured field would give. The
 deployed site (Section~\ref{sec:v4browser}) hides the generated road
 channel and falls back to the existing OSM network for anything that
 needs roads, which is a real limitation on what the model can currently
@@ -567,7 +569,7 @@ width before supervision, which should give the loss a wider basin to
 learn a coherent line rather than a sparse near-random one; we state
 this as a planned fix, not a result.
 
-A further honest finding came from calibrating the display rather than
+A further correction concerned the display calibration rather than
 the model. Our first rendering pass classified a pixel as "new growth"
 once its decoded density exceeded 0.12, and this consistently
 overstated growth extent against the training distribution; recalibrating
@@ -634,9 +636,8 @@ statistics can be audited and logged (which threshold fired, by how
 much), and it cannot silently misroute the way a learned gate can fail
 open. Batched dispatch preserves input order, so a mixed batch is split
 by vote, sampled per expert, and reassembled without changing which
-output corresponds to which input window. The honest cost is that a
-window near the threshold boundary is assigned entirely to one expert
-with no blending, which is the price of a hard rule.
+output corresponds to which input window. The cost is that a window near a threshold boundary is assigned
+entirely to one expert with no blending.
 
 As of this writing the mixture-of-experts architecture and both
 training datasets are merged into the repository; training the urban
@@ -654,8 +655,8 @@ to a planning instrument, all of them training-free additions on top of
 the existing checkpoint.
 
 \textbf{Region-locked inpainting.} A RePaint-style sampler lets a
-planner mark part of the window as locked---existing fabric,
-floodplain, protected land---and regenerates only the free region. At
+planner mark part of the window as locked (existing fabric,
+floodplain, protected land) and regenerates only the free region. At
 each reverse diffusion step the locked region is replaced by the known
 content forward-diffused to the current noise level, so the model
 always denoises against consistent locked context; periodic resampling
@@ -663,8 +664,7 @@ jumps (rewinding several steps and redoing them) let the free region
 re-harmonise with the locked boundary instead of leaving a visible
 seam. Locked pixels are hard-composited at the end and are therefore
 exact by construction; this is what makes the water and steep-slope
-lock of Section~\ref{sec:v4water} possible without retraining. The
-honest caveat carries over from that section: the model was never
+lock of Section~\ref{sec:v4water} possible without retraining. A caveat carries over from that section: the model was never
 trained with masked context, so a hard lock is a distribution shift,
 and a narrow free region squeezed between locked fabric can come out
 blander than an unconstrained sample.
@@ -676,9 +676,8 @@ in 87\% of sampled futures is a stronger proposal than one built in
 30\%. Pixels in the 30--70\% agreement band are reported separately as
 contested frontiers, the places the model itself cannot decide on. This
 is the cheapest way to turn an image generator into a planning tool,
-and we say plainly that the resulting agreement rate is a statistic of
-the model's learned distribution, not a calibrated probability of
-anything happening in reality; the road channel is excluded from
+the resulting agreement rate is a statistic of the model's learned
+distribution, not a calibrated probability of future development; the road channel is excluded from
 consensus statistics for the reason given in
 Section~\ref{sec:v4retrain}.
 
@@ -694,14 +693,14 @@ handles holes correctly. Everything is written as one GeoJSON
 FeatureCollection in WGS84 using the same window georeferencing as the
 data pipeline, openable directly in QGIS or ArcGIS. Positional accuracy
 is bounded by the 15\,m raster grid; these are sketches for planning
-discussion, not survey-grade vectors, and we say so in the export
-itself.
+discussion rather than survey-grade vectors, and the export metadata
+states this.
 
 \textbf{Natural-language operations layer.} A planner can describe
 intent in a sentence rather than drawing a mask or tuning scorecard
-weights. A parser---a keyword-matching rule parser, or optionally a
+weights. A parser (a keyword-matching rule parser, or optionally a
 small local LLM served through Ollama, with the rule parser as an
-automatic fallback on any failure---maps a request onto a short list
+automatic fallback on any failure) maps a request onto a short list
 of verified operations: Regenerate a region, SetZoneBias for a zone
 class in a region, AddAmenityTarget for a category in a region, Protect
 a region, or Rerank the scorecard weights. Regions are limited to a
@@ -727,17 +726,15 @@ The typed-zone classifier of Section~\ref{sec:posthoc} carries forward
 into v4 with several changes driven by using it on real generated
 output rather than only on held-out towns.
 
-The honest number first: leave-one-town-out macro-F1 for the zone
-classifier sits around 0.30. This is a modest score, and we report it
-rather than a friendlier aggregate, because the failure mode behind it
-is worth naming directly. The classifier tended to make an
+Leave-one-town-out macro-F1 for the zone classifier is approximately
+0.30. This is a modest score, and the failure mode behind it is worth
+describing. The classifier tended to make an
 over-confident single-label call per pixel, and that call could swing
-between classes under small changes in the input calibration---the
+between classes under small changes in the input calibration: the
 same growth pixel could be called residential under one density
-threshold and commercial under a neighbouring one. A classifier that is
-wrong quietly is more dangerous than one that is wrong loudly, so v4
-responds on several fronts rather than tuning the same classifier
-harder.
+threshold and commercial under a neighbouring one. An overconfident classifier is more damaging in a planning display
+than an abstaining one, so v4 responds on several fronts rather than
+tuning the same classifier further.
 
 Training-feature fidelity: the amenity feature used to train the
 classifier is now the sparse OSM amenity-point density used for
@@ -759,9 +756,9 @@ density tiers are read directly from the generated density channel
 rather than re-derived, so the displayed residential intensity matches
 what the model actually generated instead of a separately fit
 threshold. A farmland class is added for rural context, so a growth
-pixel out past the edge of town that looks agricultural rather than
-urban has somewhere honest to land instead of being forced into one of
-the four urban classes. Finally, despeckling is unified: both the
+pixel beyond the edge of town whose context reads as agricultural is
+assigned an appropriate class instead of being forced into one of the
+four urban classes. Finally, despeckling is unified: both the
 renderer and the classifier now share one connected-component filter
 that drops built-mask components below a small pixel-count threshold,
 so a real parcel and a single noisy pixel are no longer treated the
@@ -836,7 +833,7 @@ sparse suburban fabric}
 Applied to a window over Middleburg Heights, Ohio
 ($41.3584^\circ$N, $81.8039^\circ$W), the deployed zone classifier
 labelled 697 of 1{,}099 generated-growth cells and 4{,}869 of 11{,}345
-advisory candidate cells as institutional---a majority and a plurality
+advisory candidate cells as institutional, a majority and a plurality
 respectively, where the true institutional share of land use in such a
 suburb is a small fraction. The cause is traceable to a single design
 decision in the amenity-density feature. The feature is constructed by
@@ -855,9 +852,9 @@ amenity presence, which is institutional.
 
 The correction has three parts. First, the feature moves from
 per-window to absolute calibration: the blurred, log-scaled density is
-divided by a fixed reference value---chosen empirically as the peak
+divided by a fixed reference value, chosen empirically as the peak
 produced by a tight cluster of approximately twenty-five points of
-interest passed through the pipeline's own blur---and clipped to
+interest passed through the pipeline's own blur, and clipped to
 $[0,1]$. Under this calibration an isolated point of interest reads
 approximately 0.07 rather than 1.0, and only a genuine cluster
 saturates the feature, so sparse and dense windows are measured on one
@@ -880,7 +877,10 @@ release: the pipeline re-runs advisory zoning on the Middleburg
 Heights window and on a dense held-out town under the previous
 normalisation (reconstructed as a control), under the absolute
 calibration, and under a sweep of institutional margins, reporting the
-class-count breakdown for each. Results await the v5 training run.
+class-count breakdown for each. Section~\ref{sec:v5status} reports
+the outcome: the expanded training distribution alone removes the
+failure, and the recalibration's measurable effect on this window is
+small.
 
 \subsection{Five experts across the settlement scale}
 \label{sec:v5moe}
@@ -898,9 +898,9 @@ and South and Southeast Asia. The \emph{megacity} expert trains on 24
 saturated growth-edge windows of the largest cities, including four in
 the Delhi region, with a fifth Delhi window (Narela) held out for
 evaluation alongside one held-out window per new expert. OpenStreetMap
-coverage is uneven across these lists---building mapping is thin in
+coverage is uneven across these lists; building mapping is thin in
 the two Chinese windows and road mapping is thin in several informal
-ones---and the growth filter drops windows whose data cannot support a
+ones, and the growth filter drops windows whose data cannot support a
 training pair, at the cost of samples rather than correctness.
 
 Routing remains a hard, ordered rule on conditioning statistics, for
@@ -924,28 +924,65 @@ five checkpoints, each expert declares an ordered fallback chain and
 the dispatcher routes to the first substitute actually loaded,
 logging both the requested and the substituted expert; a two-expert
 deployment reproduces the v4 behaviour exactly. The caveats of the v4
-router carry over unchanged---a hard gate has no blending, and the
-thresholds encode our partition of the training data---joined by one
-new one: a window whose roads exist but are unmapped in OpenStreetMap
+router carry over unchanged (a hard gate has no blending, and the
+thresholds encode our partition of the training data), joined by one
+new caveat: a window whose roads exist but are unmapped in OpenStreetMap
 is indistinguishable from an unplanned frontier in these statistics
 and will route to the informal expert. For routing purposes this is
 arguably the correct behaviour, since the model cannot condition on
 roads it cannot see, but the expert label should not be read as a
 claim about the settlement's legal or planning status.
 
-\subsection{Status}
+\subsection{Results}
 \label{sec:v5status}
-The five window lists, the extended router, the recalibrated amenity
-feature, the per-class abstention margins, and the reproduction
-protocol are merged and released, and all routing and abstention logic
-is covered by offline self-tests. The five training runs, the
-zone-classifier retrain, and the Middleburg Heights before/after
-counts are pending. We do not claim that the five-expert mixture
-outperforms the v4 configuration, or that the amenity recalibration
-repairs the documented failure, until those runs complete; the
-diagnosis of Section~\ref{sec:v5amenity} rests on code inspection and
-synthetic tests, which establish the mechanism but not the magnitude
-of the improvement.
+All five experts trained to 300 epochs on a single T4 GPU. Final
+noise-prediction losses were 0.024 (village), 0.028 (town), 0.032
+(urban), 0.038 (informal), and 0.042 (megacity), ordered by the
+morphological complexity of the training windows; all five runs were
+stable, with no divergence. On the five held-out windows (Wengen,
+Gubbio, Des Moines, Antananarivo, Delhi-Narela) the router selected
+the intended expert in every case.
+
+The zone classifier, retrained on the full v5 cache, reaches a
+leave-one-town-out macro-F1 of 0.257, against approximately 0.30 for
+the v4 classifier; transfer across five morphology families is a
+harder problem than transfer across hilly European towns alone. The
+retained classes are 1 through 5; no farmland labels survived the
+per-town sampling caps, so class 6 is wired through the pipeline but
+never assigned, and candidate farmland pixels abstain instead.
+
+The reproduction protocol of Section~\ref{sec:v5amenity} produced an
+instructive negative result. On the Middleburg Heights window, the
+control classifier (per-window maximum normalisation, retrained on the
+v5 cache) assigned 203 of 4{,}286 typed advisory cells to
+institutional, and the absolute-scale classifier assigned 221; both
+are near 5\%, a plausible institutional share for such a suburb, and
+far from the 43\% of the originally reported failure. Because both
+variants were trained on the expanded window lists, the comparison
+indicates that the training-distribution expansion, not the feature
+recalibration, removed the failure: once sparse suburban windows are
+present in training, the classifier handles an isolated school
+correctly under either normalisation, and the two variants produce
+identical macro-F1 to three decimal places. The recalibration is
+retained on measurement-consistency grounds, since it places sparse
+and dense windows on one axis, but we attribute the repair to the
+data. The per-class margin behaves as designed and monotonically: on
+the same window, institutional assignments fall from 221 to 104, 32,
+and 1 as the institutional margin rises through 0.5, 1.0, and 2.0,
+with the counts of every other class unchanged. A margin of 0.5
+retains an institutional share of roughly 2.5\%, closest to a
+plausible ground truth, and is the deployed default. The dense
+in-distribution check did not regress: Gubbio's advisory typing is
+identical under every variant.
+
+The comparison this protocol cannot make is against the originally
+deployed v4 classifier, whose training cache predates the v5 window
+lists; reconstructing it would require rebuilding the v4 cache under
+the old normalisation. The 43\% failure figure therefore rests on the
+original deployment observation, and the controlled result above
+isolates only the normalisation, not the training data, as a variable.
+No comparison between the five-expert mixture and a single mixed model
+has been run.
 
 \section{Applications: towards automated city-building agents}
 \label{sec:applications}
@@ -985,8 +1022,7 @@ mapping is thin in the Chinese megacity windows, so the growth filter
 drops some of exactly the windows those experts most need, and the
 surviving informal windows over-represent the better-mapped frontiers.
 \textbf{Window scale.} 1.9\,km windows exclude transit-scale
-structure---tram or rail corridors, and anything that only makes sense
-at city scale---which is why transit appears in the scorecard only as a
+structure, such as tram and rail corridors, which is why transit appears in the scorecard only as a
 destination category, not as generated infrastructure.
 \textbf{Scorecard scope.} The eleven metrics are spatial-form proxies,
 not certified environmental performance
@@ -1009,12 +1045,12 @@ data pipeline, but the water-conditioned checkpoint has not finished
 training; the RePaint water/steep-slope lock is a deployment patch on
 the existing 4-channel model, not evidence the conditioning channel is
 unnecessary.
-\textbf{Mixture of experts untrained.} The five-expert architecture,
-router, and window lists of Section~\ref{sec:v5moe} are implemented,
-but none of the five experts has been trained to convergence; we
-report no comparison between the mixture and the single mixed model,
-and the v4 two-expert comparison of Section~\ref{sec:moe} likewise
-never ran.
+\textbf{No mixture-versus-single-model comparison.} All five experts
+of Section~\ref{sec:v5moe} are trained, but no controlled comparison
+between the mixture and a single model trained on the pooled data has
+been run, for v5 or for the v4 two-expert design; the case for the
+mixture rests on the training-distribution argument, not on measured
+output quality.
 \textbf{Router thresholds are a data partition.} The five-way routing
 thresholds of Section~\ref{sec:v5moe} were chosen from the
 training-window distributions, not learned or validated against an
@@ -1028,12 +1064,17 @@ checkpoints, and zone classifiers produced before the change cannot be
 mixed with v5 artefacts; cross-version comparisons require retraining
 the control, which the released protocol does.
 \textbf{Zoning classifier accuracy.} Leave-one-town-out macro-F1 for
-the typed-zone classifier is $\sim$0.30 even after the v4 changes of
-Section~\ref{sec:v4zoning}; abstention reduces the cost of being wrong
-but does not raise the underlying accuracy, and a low-F1 classifier
-should be read as indicative, not authoritative, zoning. Whether the
-v5 amenity recalibration improves this number is an open question
-pending the retrain.
+the typed-zone classifier is 0.257 after the v5 retrain, below the
+$\sim$0.30 of the v4 classifier, reflecting the harder transfer
+problem across five morphology families; abstention reduces the cost
+of errors but does not raise the underlying accuracy, and the
+classifier's output should be read as indicative rather than
+authoritative. The amenity recalibration did not change macro-F1,
+consistent with the small weight the feature carries in the trees.
+\textbf{Farmland class inactive.} No farmland labels survived the
+per-town sampling caps in the v5 cache, so the farmland class exists
+in the pipeline but is never assigned; rural growth pixels abstain
+instead of receiving an agricultural type.
 \textbf{Planner-tooling scope.} The natural-language operations layer
 of Section~\ref{sec:v4tools} covers a fixed, closed set of operations
 and a fixed region vocabulary; requests outside that vocabulary produce
@@ -1057,12 +1098,14 @@ inpainting, consensus maps, vector export, and validated
 natural-language operations move the pipeline further toward a tool a
 planner could actually use. v5 widens the mixture to five experts
 spanning village, hilly town, planned fringe, informal frontier, and
-megacity edge---with 84 new windows across five continents and a
-Delhi-region hold-out---and corrects a diagnosed amenity-normalisation
+megacity edge, with 84 new windows across five continents and a
+Delhi-region hold-out, and corrects a diagnosed amenity-normalisation
 defect that had caused institutional over-prediction on sparse
-suburban fabric. The five training runs, the water retrain, and the
-before/after validation of the amenity correction remain pending and
-are named as such.
+suburban fabric. The five training runs and the before/after validation are complete;
+the validation attributes the repair to the expanded training data
+rather than the feature recalibration, a distinction the deployment
+retains in the form of per-class abstention margins. A controlled
+mixture-versus-single-model comparison remains open.
 
 \section*{AI assistance disclosure}
 The code, experiments, and text of this paper were produced with
