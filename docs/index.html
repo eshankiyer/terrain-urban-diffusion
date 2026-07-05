@@ -116,8 +116,9 @@ research pipeline uses real elevation.</p>
 <p class="steps">Click anywhere on the map to drop a 1.9 km study window.
 The site fetches real elevation (AWS terrain tiles) and real roads and
 buildings (OpenStreetMap) for that spot, runs the model, and drapes the
-generated growth over the map. Small towns in hilly Europe or Asia match
-the training data best; megacities will confuse it.</p>
+generated growth over the map. Five experts cover villages, hilly towns,
+planned fringes, informal frontiers, and megacity edges; the router
+picks one per window and the status line reports which.</p>
 <div id="map"></div>
 <div class="toolbar" style="margin-top:10px">
   <button id="grow-real" class="primary" disabled>Grow this place →</button>
@@ -149,11 +150,14 @@ the training data best; megacities will confuse it.</p>
 </div>
 
 <h2>What you are looking at</h2>
-<p>The model is a compact conditional U-Net (~13M parameters) that denoises
-a growth plan given four conditioning rasters: elevation, slope, the
-existing built footprint, and the existing road network. Version 3 emits
-three channels: new roads, new built density, and a proposed
-amenity-density field. Alongside housing, it suggests where a bakery,
+<p>The model is a mixture of five compact conditional U-Nets (~13M
+parameters each), one per growth regime: village, hilly town, planned
+flat fringe, informal peri-urban frontier, and megacity edge. A hard
+router on the conditioning statistics picks the expert for each window,
+and each expert denoises a growth plan given five conditioning rasters:
+elevation, slope, the existing built footprint, the road network, and
+water. The output has three channels: new roads, new built density, and
+a proposed amenity-density field. Alongside housing, it suggests where a bakery,
 school or clinic would let the new streets work as a 15-minute
 neighbourhood. In the full pipeline, sixteen futures are sampled per site
 and an 11-metric scorecard (walk coverage, green preservation, flood and
@@ -170,16 +174,34 @@ sustainable ones.</p>
 <figure>
   <img src="assets/Gubbio_today.png" alt="Gubbio, Italy: existing footprint" style="width:48%;display:inline-block;">
   <img src="assets/Gubbio_future2.png" alt="Gubbio, Italy: generated growth plan" style="width:48%;display:inline-block;margin-left:2%;">
-  <figcaption>Gubbio, Italy: existing footprint (left) vs. a generated
-  growth plan (right), v4 model &mdash; routed through the two-expert
-  (town/urban) MoE, with water conditioning and suggested bike lanes
-  (teal) overlaid on the road network.</figcaption>
+  <figcaption>Gubbio, Italy (held out): existing footprint (left) vs. a
+  generated growth plan (right), v5 five-expert model, routed to the
+  town expert.</figcaption>
+</figure>
+<figure>
+  <img src="assets/Wengen_today.png" alt="Wengen, Switzerland: existing footprint" style="width:48%;display:inline-block;">
+  <img src="assets/Wengen_future1.png" alt="Wengen, Switzerland: generated growth plan" style="width:48%;display:inline-block;margin-left:2%;">
+  <figcaption>Wengen, Switzerland (held out): a village-scale window
+  routed to the village expert.</figcaption>
+</figure>
+<figure>
+  <img src="assets/Delhi_N_Narela_today.png" alt="Delhi, Narela: existing footprint" style="width:48%;display:inline-block;">
+  <img src="assets/Delhi_N_Narela_future1.png" alt="Delhi, Narela: generated growth plan" style="width:48%;display:inline-block;margin-left:2%;">
+  <figcaption>Delhi, Narela (held out): a megacity growth edge routed to
+  the megacity expert.</figcaption>
+</figure>
+<figure>
+  <img src="assets/Antananarivo_W_fringe_today.png" alt="Antananarivo west fringe: existing footprint" style="width:48%;display:inline-block;">
+  <img src="assets/Antananarivo_W_fringe_future1.png" alt="Antananarivo west fringe: generated growth plan" style="width:48%;display:inline-block;margin-left:2%;">
+  <figcaption>Antananarivo, Madagascar, western fringe (held out): an
+  informal peri-urban frontier routed to the informal expert.</figcaption>
 </figure>
 <figure>
   <img src="assets/Des_Moines_NW_fringe_today.png" alt="Des Moines NW fringe: existing footprint" style="width:48%;display:inline-block;">
   <img src="assets/Des_Moines_NW_fringe_future2.png" alt="Des Moines NW fringe: generated growth plan" style="width:48%;display:inline-block;margin-left:2%;">
-  <figcaption>Des Moines, Iowa (NW urban fringe): existing footprint (left)
-  vs. a generated growth plan (right), v4 model.</figcaption>
+  <figcaption>Des Moines, Iowa (NW urban fringe, a training window kept
+  as a routing check): existing footprint (left) vs. a generated growth
+  plan (right), v5 model, routed to the urban expert.</figcaption>
 </figure>
 
 <footer>Research preview · outputs are plausible morphology, not engineering
@@ -327,12 +349,17 @@ function condFrom(roads, built, elev, water) {
 /* ---------- zone typing + steering: pure helpers ---------- */
 /*PURE*/
 const ZONE_NAMES = {1:"residential",2:"commercial",3:"industrial",4:"institutional",5:"mixed",6:"farmland"};
-// Classes 5 ("mixed use") and 6 ("farmland") won't fire until the retrained
-// zone_clf.json ships (deployed weights only know classes 1-4) -- colours
-// are wired up ready for it. Farmland gives a growth pixel that reads as
-// rural, not urban, somewhere honest to land instead of a forced pick
-// among the four urban classes (see src/data_v3.py module docstring).
+// The v5 zone_clf.json is trained on classes 1-5 (mixed use included).
+// Farmland (6) is wired up but absent from the training labels, so it
+// never fires; those pixels abstain to plain orange instead.
 const ZONE_RGB = {1:[242,209,107],2:[224,101,95],3:[165,139,196],4:[111,168,220],5:[224,143,60],6:[168,198,134]};
+// Per-class abstention margins on top of the uniform 0.5 bar, mirroring
+// zones.py class_margins. Institutional keeps a higher bar: on the
+// Middleburg Heights validation window the margin sweep left 104 (0.5),
+// 32 (1.0) and 1 (2.0) institutional cells of ~4,200 typed; 1.0 keeps
+// institutional claims rare without touching the other classes.
+const CLASS_MARGINS = {4: 1.0};
+const marginOK = (z, m) => m > Math.max(0.5, CLASS_MARGINS[z] || 0);
 function boxBlur(src, r, w, h) {   // replicate-edge box blur (ports data_v3._box_blur)
   w=w||G; h=h||G;
   if (r<=0) return Float64Array.from(src);
@@ -684,9 +711,16 @@ async function runDDIM(sess, cond, statusNode, keepMask, xKnown) {
   return x;
 }
 
-let sessions = { town: null, urban: null }, modelMissing = false;
-// ---------- MoE: two experts + moe.py's hard conditioning-stats router ----------
-const SLOPE_T = 0.18, BUILT_T = 0.055, ROAD_T = 0.030;   // mirrors src/moe.py
+let sessions = {};   // per-expert, lazy: only the routed expert downloads
+// ---------- MoE: five experts + moe.py's hard conditioning-stats router ----------
+const SLOPE_T = 0.18, BUILT_T = 0.055, ROAD_T = 0.030;      // mirrors src/moe.py
+const VILLAGE_T = 0.02, MEGA_T = 0.22;                      // built-fraction bands
+const INFORMAL_BUILT_T = 0.10, INFORMAL_RATIO_T = 0.35;     // roads-per-built
+// Substitutes in preference order when an expert's weights are not
+// published; a two-expert deployment (town+urban) reproduces v4 routing.
+const FALLBACK = { village:["town","urban"], town:["urban"], urban:["town"],
+                   informal:["urban","megacity","town"],
+                   megacity:["urban","informal","town"] };
 function routeExpert(cond) {
   const n = G*G;
   let slopeSum = 0, builtN = 0, roadN = 0;
@@ -696,9 +730,14 @@ function routeExpert(cond) {
     if (cond[3*n+i] > 0.5) roadN++;
   }
   const slopeMean = slopeSum/n, builtFrac = builtN/n, roadFrac = roadN/n;
-  const votes = (slopeMean < SLOPE_T ? 1:0) + (builtFrac > BUILT_T ? 1:0)
-              + (roadFrac > ROAD_T ? 1:0);
-  return votes >= 2 ? "urban" : "town";
+  const ratio = roadFrac / Math.max(builtFrac, 1e-6);
+  if (builtFrac < VILLAGE_T) return "village";      // near-empty window
+  if (builtFrac > MEGA_T) return "megacity";        // saturated metro edge
+  if (builtFrac > INFORMAL_BUILT_T && ratio < INFORMAL_RATIO_T)
+    return "informal";                              // buildings outpace roads
+  if (slopeMean >= SLOPE_T) return "town";          // hilly
+  if (builtFrac > BUILT_T || roadFrac > ROAD_T) return "urban";
+  return "town";
 }
 const MODEL_PARTS = 3;   // each *.onnx split into <10MB parts for hosting
 async function fetchModelBuffer(name) {
@@ -714,25 +753,22 @@ async function fetchModelBuffer(name) {
   for (const b of bufs) { out.set(new Uint8Array(b), off); off += b.byteLength; }
   return out;
 }
-async function getSessions() {
-  if (sessions.town || modelMissing) return sessions;
-  try {
-    statusEl.textContent = "loading model weights (~46 MB total, first time only)…";
-    const [townBuf, urbanBuf] = await Promise.all([
-      fetchModelBuffer("model_town"), fetchModelBuffer("model_urban")]);
-    [sessions.town, sessions.urban] = await Promise.all([
-      ort.InferenceSession.create(townBuf, { executionProviders: ["wasm"] }),
-      ort.InferenceSession.create(urbanBuf, { executionProviders: ["wasm"] })]);
-  } catch (e) {
-    modelMissing = true;
-    document.getElementById("modelnote").innerHTML =
-      '<div class="warn">Model weights are not published on this site yet ' +
-      '(v3 training in progress). Your plan parses fine, and the same drawing ' +
-      'convention works in the <a href="https://colab.research.google.com/' +
-      'github/eshankiyer/terrain-urban-diffusion/blob/v3/notebooks/' +
-      'v3_zoned_towns_colab.ipynb">Colab notebook</a>, cell 6.</div>';
+async function getExpert(name, statusNode) {
+  // lazy per-expert load, walking the fallback chain on missing weights;
+  // sessions[x] === false marks "tried and not published"
+  for (const cand of [name].concat(FALLBACK[name] || [])) {
+    if (sessions[cand]) return { sess: sessions[cand], used: cand };
+    if (sessions[cand] === false) continue;
+    try {
+      if (statusNode) statusNode.textContent =
+        "loading " + cand + " expert weights (~23 MB, first time only)\u2026";
+      const buf = await fetchModelBuffer("model_" + cand);
+      sessions[cand] = await ort.InferenceSession.create(buf,
+        { executionProviders: ["wasm"] });
+      return { sess: sessions[cand], used: cand };
+    } catch (e) { sessions[cand] = false; }
   }
-  return sessions;
+  return { sess: null, used: null };
 }
 async function generate() {
   const btn = document.getElementById("go");
@@ -742,11 +778,19 @@ async function generate() {
     const elev = heightmap(7);
     const cond = condFrom(roads, built, elev, water);
     renderOut(elev, roads, built, parks, null, null, null, null);  // parsed plan now
-    const sessAll = await getSessions();
-    const expert = sessAll.town ? routeExpert(cond) : null;
-    const sess = expert ? sessAll[expert] : null;
-    if (!sess) { statusEl.textContent = "showing parsed plan only (no weights)"; return; }
-    statusEl.textContent = "routed to " + expert + " expert…";
+    const expert = routeExpert(cond);
+    const { sess, used } = await getExpert(expert, statusEl);
+    if (!sess) {
+      document.getElementById("modelnote").innerHTML =
+        '<div class="warn">Model weights are not published on this site yet. ' +
+        'Your plan parses fine, and the same drawing convention works in the ' +
+        '<a href="https://colab.research.google.com/github/eshankiyer/' +
+        'terrain-urban-diffusion/blob/v3/notebooks/v5_global_moe_colab.ipynb">' +
+        'Colab notebook</a>, cell 6.</div>';
+      statusEl.textContent = "showing parsed plan only (no weights)"; return;
+    }
+    statusEl.textContent = "routed to " + expert + " expert"
+      + (used !== expert ? " (using " + used + ", nearest published)" : "") + "…";
     // STEEP LOCK: slope > 25 deg (landslide-proxy threshold, see steepMask)
     // joins the RePaint keepMask like parks -- locked to -1 = no growth.
     const steep = steepMask(elev, 25);
@@ -819,8 +863,8 @@ function renderOut(elev, roads, built, parks, gen, amen, cg, steep) {
     // + dropSmallComponents), so painting can never disagree with typing.
     if (gen && gen.mask && gen.mask[i]) {
       // ABSTAIN: only trust a typed colour when margin/context clear the bar
-      const z = (cg && cg.zones[i] && cg.margin[i] > 0.5 && cg.context[i] > 0.02)
-        ? cg.zones[i] : 0;
+      const z = (cg && cg.zones[i] && marginOK(cg.zones[i], cg.margin[i])
+                 && cg.context[i] > 0.02) ? cg.zones[i] : 0;
       if (z === 1) {
         const t = gen.newDens[i] > 0.6 ? 2 : gen.newDens[i] > 0.35 ? 1 : 0;
         const c = RES_TIER_RGB[t]; r=c[0]; g=c[1]; b=c[2];
@@ -1008,15 +1052,15 @@ async function fetchOSMReal(lat, lon) {
     else if (r0 > g0 && Math.max(r0,g0,b0)-Math.min(r0,g0,b0) > 60) built[i] = 1;
     if (wd[4*i+2] > 128 && wd[4*i] < 64 && wd[4*i+1] < 64) water[i] = 1;
   }
-  /* real amenity density, exactly like data_v3.amenity_density:
-     counts -> box blur r=4 -> log1p -> normalize to max 1 */
+  /* real amenity density, exactly like data_v3.amenity_density (v5):
+     counts -> box blur r=4 -> log1p -> ABSOLUTE scale (divide by
+     AMEN_REF, clip to 1). The old per-window max normalization forced a
+     lone suburban school to read 1.0, the cause of the institutional
+     over-prediction measured at Middleburg Heights, OH. */
+  const AMEN_REF = 0.18;
   const amenReal = boxBlur(counts, 4);
-  let mx = 0;
-  for (let i = 0; i < G * G; i++) {
-    amenReal[i] = Math.log1p(amenReal[i]);
-    if (amenReal[i] > mx) mx = amenReal[i];
-  }
-  if (mx > 0) for (let i = 0; i < G * G; i++) amenReal[i] /= mx;
+  for (let i = 0; i < G * G; i++)
+    amenReal[i] = Math.min(1, Math.log1p(amenReal[i]) / AMEN_REF);
   return { roads, built, water, amenReal };
 }
 
@@ -1106,8 +1150,8 @@ async function paintReal() {
       else if (mask[i]) {
         // ABSTAIN: below the margin/context threshold, stay plain orange
         // growth instead of a (probably unreliable) typed zone colour.
-        const z = zones && zones[i] && margin[i] > 0.5 && context[i] > 0.02
-          ? zones[i] : 0;
+        const z = zones && zones[i] && marginOK(zones[i], margin[i])
+          && context[i] > 0.02 ? zones[i] : 0;
         if (z === 1) cell(i, resTier(dNew[i]));
         else if (z) cell(i, zc[z]);
         else cell(i, "rgba(242,182,96,0.78)");  // orange = untyped growth
@@ -1133,7 +1177,7 @@ async function paintReal() {
                   3:"rgba(165,139,196,0.35)", 4:"rgba(111,168,220,0.35)",
                   5:"rgba(224,143,60,0.35)", 6:"rgba(168,198,134,0.35)"};
       for (let i = 0; i < n; i++)
-        if (cand[i] && adv.zones[i] && adv.margin[i] > 0.5)
+        if (cand[i] && adv.zones[i] && marginOK(adv.zones[i], adv.margin[i]))
           cell(i, za[adv.zones[i]]);
     }
   }
@@ -1187,10 +1231,10 @@ growBtn.onclick = async () => {
       statusReal.textContent = "this window has almost no existing town to " +
         "anchor on — the model extrapolates poorly here; try clicking on a small town";
     const cond = condFrom(osm.roads, osm.built, elev, osm.water);
-    const sessAll = await getSessions();
-    const expert = sessAll.town ? routeExpert(cond) : null;
-    const sess = expert ? sessAll[expert] : null;
-    statusReal.textContent = expert ? ("routed to " + expert + " expert; fetching elevation and OSM data") : statusReal.textContent;
+    const expert = routeExpert(cond);
+    const { sess, used } = await getExpert(expert, statusReal);
+    if (sess) statusReal.textContent = "routed to " + expert + " expert"
+      + (used !== expert ? " (using " + used + ", nearest published)" : "");
     const bounds = windowBounds(pick.lat, pick.lng);
     let x = null, amen = null;
     if (sess) {
@@ -1252,9 +1296,7 @@ document.getElementById("nl-apply").onclick = async () => {
   }
   try {
     if (protectOp) {
-      const sessAllP = await getSessions();
-      const expertP = sessAllP.town ? routeExpert(lastReal.cond) : null;
-      const sess = expertP ? sessAllP[expertP] : null;
+      const { sess } = await getExpert(routeExpert(lastReal.cond), statusReal);
       const n = G*G, m = regionMask(protectOp.region);
       const keep = Float32Array.from(m);
       let c = 0; for (let i=0;i<n;i++) c += m[i];
