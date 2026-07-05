@@ -23,6 +23,16 @@ only inspects classes 1 (residential) and 2 (commercial); class 6
 proxy, so it is never relabelled and never triggers a relabel of its
 neighbours.
 
+Per-class abstention (v5): assign_zones and zone_potential accept
+class_margins, a dict mapping class id -> minimum classifier margin for
+that class specifically. This exists because institutional (class 4)
+turned out to have the loosest decision region: on sparse US suburban
+windows it absorbed most of the map (Middleburg Heights: 697/1099 growth
+cells). The feature-side fix lives in data_v3.amenity_density; the
+margin knob is the belt to that suspender, letting a caller demand more
+evidence before painting institutional without also gutting classes that
+were behaving. Untouched classes keep the uniform min_margin.
+
 Dependencies: numpy, scipy, scikit-learn.
 """
 
@@ -40,10 +50,10 @@ from data_v3 import ZONE_NAMES as _ZONE_NAMES_V3, _box_blur
 ZONE_NAMES = dict(_ZONE_NAMES_V3)
 ZONE_NAMES[5] = "mixed"
 
-MAX_PX_PER_CLASS = 400   # per town, to cap residential dominance
+MAX_PX_PER_CLASS = 400  # per town, to cap residential dominance
 N_FEATURES = 6
 MIXED_USE_CLASS = 5
-MIXED_USE_RADIUS = 3     # Chebyshev (square) radius for co-occurrence check
+MIXED_USE_RADIUS = 3  # Chebyshev (square) radius for co-occurrence check
 
 
 def _chebyshev_dilate(mask, r):
@@ -56,7 +66,7 @@ def _chebyshev_dilate(mask, r):
     for dy in range(-r, r + 1):
         for dx in range(-r, r + 1):
             out |= padded[r + dy:r + dy + mask.shape[0],
-                         r + dx:r + dx + mask.shape[1]]
+                          r + dx:r + dx + mask.shape[1]]
     return out
 
 
@@ -186,8 +196,23 @@ def predict_with_margin(clf, X):
     return labels, margin
 
 
+def _margin_keep(labels, margin, min_margin=0.0, class_margins=None):
+    """Bool mask: which predictions clear their margin requirement.
+    Every prediction must clear min_margin; a class listed in
+    class_margins must additionally clear its own (higher) bar. A
+    class_margins entry BELOW min_margin has no effect -- this knob only
+    tightens, never loosens."""
+    thr = np.full(len(labels), float(min_margin))
+    if class_margins:
+        for cls, m in class_margins.items():
+            sel = labels == cls
+            thr[sel] = np.maximum(thr[sel], float(m))
+    return margin >= thr
+
+
 def assign_zones(dens_new, roads_all, elev, amen, clf, d0=None,
-                 thr=0.05, min_margin=0.0, min_context=0.0):
+                 thr=0.05, min_margin=0.0, min_context=0.0,
+                 class_margins=None):
     """Class raster over NEW development pixels (0 elsewhere).
 
     min_margin / min_context implement abstention: a pixel whose
@@ -195,10 +220,11 @@ def assign_zones(dens_new, roads_all, elev, amen, clf, d0=None,
     local density context (box-blurred dens_new, radius 4, i.e. feature
     f3 already computed in feature_stack) is below min_context, is left
     class 0 ("untyped") instead of being forced into one of the trained
-    classes. Defaults (0.0, 0.0) keep the old always-assign behaviour
-    since margins and context are always >= 0.
+    classes. class_margins raises the margin bar for specific classes
+    only (institutional over-prediction was the motivating case; see
+    module docstring). Defaults keep the old always-assign behaviour.
 
-    new_dev now comes from data.built_mask (thresh + despeckle), the same
+    new_dev comes from data.built_mask (thresh + despeckle), the same
     helper render.py uses, so a 1-2 px density blip can't get a zone
     colour painted on the map that the plan renderer would never show."""
     from data import built_mask
@@ -210,11 +236,9 @@ def assign_zones(dens_new, roads_all, elev, amen, clf, d0=None,
     feats = feature_stack(elev, roads_all, dens_new, amen)
     X = feats[ys, xs]
     labels, margin = predict_with_margin(clf, X)
-    context = X[:, 3]   # local_dens, same box-blur(dens, 4) feature_stack builds
-    keep = np.ones(len(ys), dtype=bool)
-    if min_margin > 0.0:
-        keep &= margin >= min_margin
+    keep = _margin_keep(labels, margin, min_margin, class_margins)
     if min_context > 0.0:
+        context = X[:, 3]  # local_dens from feature_stack
         keep &= context >= min_context
     assigned = np.zeros(len(ys), dtype=np.uint8)
     assigned[keep] = labels[keep].astype(np.uint8)
@@ -223,17 +247,18 @@ def assign_zones(dens_new, roads_all, elev, amen, clf, d0=None,
 
 
 def zone_potential(d0, roads_now, elev, amen, clf, ring_px=8,
-                   exclude=None, min_margin=0.0):
+                   exclude=None, min_margin=0.0, class_margins=None):
     """Advisory zoning over land that COULD develop next, before any model
     sample commits growth there. Candidates are the undeveloped ring within
     ring_px (Chebyshev) of the current footprint, minus roads and any
     exclude mask (water, steep slopes, protected land). Each candidate is
     typed with the same features and classifier used for generated growth;
-    margins below min_margin abstain to class 0. This answers a different
-    question than assign_zones: not "what did the model build and what is
-    it", but "if this parcel develops, what use fits its context". Pairing
-    it with the generated-density map gives a planner both where expansion
-    is likely and what to put there."""
+    predictions below their margin bar (uniform min_margin, per-class
+    class_margins) abstain to class 0. This answers a different question
+    than assign_zones: not "what did the model build and what is it", but
+    "if this parcel develops, what use fits its context". Pairing it with
+    the generated-density map gives a planner both where expansion is
+    likely and what to put there."""
     foot = d0 > 0.05
     ring = _chebyshev_dilate(foot, ring_px) & ~_chebyshev_dilate(foot, 1)
     cand = ring & ~roads_now.astype(bool)
@@ -245,8 +270,7 @@ def zone_potential(d0, roads_now, elev, amen, clf, ring_px=8,
         return out
     feats = feature_stack(elev, roads_now, d0, amen)
     labels, margin = predict_with_margin(clf, feats[ys, xs])
-    keep = margin >= min_margin if min_margin > 0.0 \
-        else np.ones(len(ys), dtype=bool)
+    keep = _margin_keep(labels, margin, min_margin, class_margins)
     lab = np.zeros(len(ys), dtype=np.uint8)
     lab[keep] = labels[keep].astype(np.uint8)
     out[ys, xs] = lab
@@ -254,16 +278,13 @@ def zone_potential(d0, roads_now, elev, amen, clf, ring_px=8,
 
 
 def _self_test():
-    """numpy-only sanity check for relabel_mixed_use: a residential block
-    adjacent to a commercial strip should get a class-5 boundary band,
-    an isolated residential block far away stays class 1, and farmland
-    (class 6) right next to the same commercial strip is never relabelled
-    (relabel_mixed_use only inspects classes 1 and 2)."""
+    """numpy-only sanity checks: relabel_mixed_use behaviour, and the
+    per-class margin mask."""
     zones = np.zeros((40, 40), dtype=np.uint8)
-    zones[5:15, 5:15] = 1                  # residential block A
-    zones[5:15, 16:20] = 2                 # commercial strip, touching A
-    zones[30:36, 30:36] = 1                # isolated residential block B
-    zones[5:15, 21:26] = 6                 # farmland, touching the same strip
+    zones[5:15, 5:15] = 1    # residential block A
+    zones[5:15, 16:20] = 2   # commercial strip, touching A
+    zones[30:36, 30:36] = 1  # isolated residential block B
+    zones[5:15, 21:26] = 6   # farmland, touching the same strip
 
     out = relabel_mixed_use(zones, radius=MIXED_USE_RADIUS)
 
@@ -297,6 +318,24 @@ def _self_test():
 
     print(f"relabel_mixed_use self-test OK: {n_mixed} px relabelled mixed, "
           f"isolated block untouched, far corner stays residential.")
+
+    # --- per-class margin mask ---
+    labels = np.array([1, 4, 4, 2, 4], dtype=np.int64)
+    margin = np.array([0.3, 0.3, 1.2, 0.1, 0.6])
+    # uniform bar only: everything above 0.2 stays
+    keep = _margin_keep(labels, margin, min_margin=0.2)
+    assert keep.tolist() == [True, True, True, False, True]
+    # raise the institutional bar to 1.0: the two weak class-4 hits
+    # abstain, the strong one survives, other classes are untouched
+    keep = _margin_keep(labels, margin, min_margin=0.2,
+                        class_margins={4: 1.0})
+    assert keep.tolist() == [True, False, True, False, False]
+    # a class_margins entry below min_margin must not loosen the bar
+    keep = _margin_keep(labels, margin, min_margin=0.5,
+                        class_margins={4: 0.1})
+    assert keep.tolist() == [False, False, True, False, True]
+    print("per-class margin mask self-test OK: institutional bar raised "
+          "without touching other classes, and it never loosens.")
 
 
 if __name__ == "__main__":

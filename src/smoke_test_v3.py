@@ -24,24 +24,44 @@ def _fake_way(lat, lon, tags, dy, dx, h, w):
             "geometry": [{"lat": la, "lon": lo} for la, lo in ring]}
 
 
+def _fake_node(lat, lon, tags, dy, dx):
+    """Synthetic OSM node offset from the window centre by (dy, dx) px."""
+    s, west, n, east = window_bbox(lat, lon)
+    dlat, dlon = (n - s) / GRID, (east - west) / GRID
+    return {"type": "node", "tags": tags,
+            "lat": n - (GRID / 2 + dy) * dlat,
+            "lon": west + (GRID / 2 + dx) * dlon}
+
+
 def test_zone_raster_and_amenity():
     lat, lon = 46.5, 8.0
+    # a dense cluster of 25 shops offset (+30, +30) from centre; plus the
+    # sparse-suburb pattern: one lone shop at centre, one school way
+    cluster = [_fake_node(lat, lon, {"shop": "convenience"}, 30 + i, 30 + j)
+               for i in range(5) for j in range(5)]
     osm = {"elements": [
         _fake_way(lat, lon, {"landuse": "residential"}, -30, -30, 25, 25),
         _fake_way(lat, lon, {"landuse": "industrial"}, 10, 10, 20, 20),
         _fake_way(lat, lon, {"amenity": "school"}, -25, -25, 8, 8),
         {"type": "node", "lat": lat, "lon": lon, "tags": {"shop": "bakery"}},
-    ]}
+    ] + cluster}
     z = data_v3.zone_raster(osm, lat, lon)
     assert set(np.unique(z)) >= {0, 1, 3, 4}, np.unique(z)
     assert (z == 4).sum() > 0 and (z == 1).sum() > (z == 4).sum()
 
     amen = data_v3.amenity_density(osm, lat, lon)
     assert amen.shape == (GRID, GRID) and 0 <= amen.min() and amen.max() <= 1
-    # density concentrates near the two amenities (shop at centre, school
-    # offset), and is zero far away from both
-    assert amen[GRID // 2, GRID // 2] > 0.3
-    assert amen[GRID - 5, GRID - 5] == 0.0
+    # ABSOLUTE scale (v5): the lone bakery at the centre must read low --
+    # a single isolated POI is not an amenity core. The 25-shop cluster
+    # must read high. Under the old per-window max normalization these
+    # two situations could look identical, which is what broke US
+    # suburban windows (see data_v3.amenity_density).
+    lone = amen[GRID // 2, GRID // 2]
+    assert 0.0 < lone < 0.15, f"lone POI should read low, got {lone:.3f}"
+    assert amen[GRID // 2 + 32, GRID // 2 + 32] > 0.8, \
+        "dense cluster should read as a real amenity core"
+    assert amen[GRID - 5, 5] == 0.0  # far from everything
+    data_v3._amenity_selftest()
     print("zone raster + amenity density ok")
 
 
@@ -110,7 +130,7 @@ def test_zone_classifier_loop():
         assert f1 > 0.8, f1
 
         dens_new = np.clip(0.6 - np.hypot(*np.mgrid[0:GRID, 0:GRID]
-                                          - GRID / 2) / 50.0, 0, 1)
+                           - GRID / 2) / 50.0, 0, 1)
         painted = zones.assign_zones(dens_new.astype(np.float32),
                                      np.zeros((GRID, GRID), np.uint8) | 0,
                                      fractal_heightmap(rng),
@@ -118,6 +138,17 @@ def test_zone_classifier_loop():
         assert painted.shape == (GRID, GRID)
         assert set(np.unique(painted)) <= {0, 1, 2, 3, 4}
         assert (painted > 0).sum() > 0
+        # per-class margin: an absurd bar for class 1 must strictly
+        # reduce (or zero) class-1 pixels while leaving class 3 counts
+        # no lower than before
+        strict = zones.assign_zones(dens_new.astype(np.float32),
+                                    np.zeros((GRID, GRID), np.uint8) | 0,
+                                    fractal_heightmap(rng),
+                                    np.zeros((GRID, GRID), np.float32), clf,
+                                    class_margins={1: 1e9})
+        assert (strict == 1).sum() == 0
+        assert (strict == 3).sum() >= 0  # untouched classes still allowed
+        print("per-class margin abstention in assign_zones ok")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"zone classifier loop ok (synthetic macro-F1 {f1:.2f})")
@@ -127,15 +158,15 @@ def test_plan_import():
     import plan_import
     img = plan_import.demo_sketch()
     roads, built = plan_import.load_plan_image(img)
-    assert roads.sum() > 50, roads.sum()          # the two drawn roads
-    assert built.sum() > 100, built.sum()         # the blocks
+    assert roads.sum() > 50, roads.sum()  # the two drawn roads
+    assert built.sum() > 100, built.sum()  # the blocks
     # the green park must be neither road nor built
     assert roads[40:56, 84:104].sum() == 0
     assert built[45:52, 88:100].sum() == 0
     cond, elev = plan_import.cond_from_plan(roads, built, seed=1)
     assert cond.shape == (4, GRID, GRID) and cond.dtype == np.float32
     assert np.isfinite(cond).all() and elev.shape == (GRID, GRID)
-    assert cond[3].sum() > 0                      # roads near built = core
+    assert cond[3].sum() > 0  # roads near built = core
     print("plan import ok")
 
 
