@@ -73,6 +73,25 @@ maps planner intent to a validated, geometry-free operation schema
 executed against those tools---together with an updated zoning stage
 and a browser deployment that runs the diffusion model and the zone
 classifier client-side.
+
+The present version (v5) extends the pipeline in two further
+directions. First, the two-expert mixture is widened to five experts
+covering the principal contemporary growth regimes: village, hilly
+small town, planned flat fringe, informal peri-urban frontier, and
+megacity edge. Dispatch remains a hard, auditable rule on conditioning
+statistics, extended with a roads-per-built-area ratio that separates
+unplanned from planned growth, and 84 additional training and
+evaluation windows across Latin America, Africa, South and Southeast
+Asia, China, Australasia, and Canada accompany the new experts, with a
+Delhi-region window held out for evaluation. Second, we diagnose and
+correct a failure of the typed-zone classifier observed on a
+car-dependent United States suburb, where a majority of candidate
+cells were labelled institutional: the cause is per-window maximum
+normalisation of the amenity-density feature, which we replace with an
+absolute calibration, complemented by per-class abstention margins.
+Training of the five experts had not completed at the time of writing,
+and we report the design, the data, and the reproduction protocol
+rather than performance claims.
 \end{abstract}
 
 \section{Introduction}
@@ -624,7 +643,8 @@ training datasets are merged into the repository; training the urban
 expert to convergence has not run. We report the design and the data,
 not a result, and we do not claim the two-expert model outperforms the
 single mixed model of Section~\ref{sec:v4retrain} until that training
-run completes.
+run completes. Section~\ref{sec:v5moe} supersedes this two-expert
+design with a five-expert mixture; the routing philosophy is unchanged.
 
 \subsection{Planner-facing tooling}
 \label{sec:v4tools}
@@ -792,6 +812,141 @@ the towns in the training and evaluation lists, subject to the same OSM
 coverage caveats as the rest of the pipeline
 (Section~\ref{sec:limitations}).
 
+\section{v5: global expert coverage and amenity-scale correction}
+\label{sec:v5}
+
+The v4 mixture of Section~\ref{sec:moe} encodes exactly two growth
+regimes, and most of the world's observed settlement growth belongs to
+neither. Informal peri-urban expansion around cities such as Lima,
+Nairobi, and Dhaka proceeds with building construction outrunning the
+mapped road network; the growth edges of megacities such as Delhi
+absorb population at densities the town and urban experts never see;
+and at the opposite end of the scale, village growth begins from
+windows that are almost entirely unbuilt. v5 addresses this coverage
+gap, together with a defect in the zone classifier's amenity feature
+that surfaced when the deployed tool was applied to a car-dependent
+United States suburb. We follow the same reporting convention as
+Section~\ref{sec:v4}: the architecture, data, and correction are
+merged and released; training of the new experts had not completed at
+the time of writing, and no performance comparison is claimed.
+
+\subsection{A diagnosed failure: institutional over-prediction on
+sparse suburban fabric}
+\label{sec:v5amenity}
+Applied to a window over Middleburg Heights, Ohio
+($41.3584^\circ$N, $81.8039^\circ$W), the deployed zone classifier
+labelled 697 of 1{,}099 generated-growth cells and 4{,}869 of 11{,}345
+advisory candidate cells as institutional---a majority and a plurality
+respectively, where the true institutional share of land use in such a
+suburb is a small fraction. The cause is traceable to a single design
+decision in the amenity-density feature. The feature is constructed by
+box-blurring OpenStreetMap point-of-interest counts and log-scaling
+the result, then dividing by the maximum value within the window. This
+per-window normalisation forces some location in every window to read
+1.0. In the dense European and Asian training towns, where dozens of
+points of interest co-occur within a few blocks, a moderate normalised
+value is a reliable correlate of an institutional core. A
+car-dependent suburb inverts the pattern: a school or hospital
+standing alone on a large single-use parcel still becomes the window
+maximum, and the blur spreads an elevated halo around it. The
+classifier, never having observed an isolated, unclustered amenity
+peak, resolves the unfamiliar signal to the class most associated with
+amenity presence, which is institutional.
+
+The correction has three parts. First, the feature moves from
+per-window to absolute calibration: the blurred, log-scaled density is
+divided by a fixed reference value---chosen empirically as the peak
+produced by a tight cluster of approximately twenty-five points of
+interest passed through the pipeline's own blur---and clipped to
+$[0,1]$. Under this calibration an isolated point of interest reads
+approximately 0.07 rather than 1.0, and only a genuine cluster
+saturates the feature, so sparse and dense windows are measured on one
+axis. Because the amenity map is stored in the per-town caches and
+enters both the diffusion targets and the classifier features, the
+recalibration invalidates all caches and classifiers produced under
+the previous normalisation; the pipeline enforces separate cache
+directories for this reason. Second, the abstention mechanism of
+Section~\ref{sec:v4zoning} is extended with per-class margins: a
+caller may require a larger classification margin for a designated
+class (institutional being the motivating case) without altering the
+treatment of the remaining classes, and the per-class threshold can
+only tighten the uniform one, never loosen it. Third, the classifier's
+training distribution now contains the offending morphology: the v5
+window lists add Australian, New Zealand, and Canadian planned suburbs
+to the existing United States windows, so an isolated school on a
+parking lot is a pattern the classifier is trained on rather than an
+out-of-distribution surprise. A reproduction protocol accompanies the
+release: the pipeline re-runs advisory zoning on the Middleburg
+Heights window and on a dense held-out town under the previous
+normalisation (reconstructed as a control), under the absolute
+calibration, and under a sweep of institutional margins, reporting the
+class-count breakdown for each. Results await the v5 training run.
+
+\subsection{Five experts across the settlement scale}
+\label{sec:v5moe}
+v5 widens the mixture to five experts sharing one architecture. The
+\emph{village} expert trains on 22 windows around villages that grew
+measurably between 1980 and 2020, selected because the growth filter
+of Section~\ref{sec:temporal} discards windows without observable
+change. The \emph{town} expert retains the original hilly small-town
+data, and the \emph{urban} expert retains the planned flat-fringe data
+of Section~\ref{sec:moe}, extended by ten Australian, New Zealand, and
+Canadian suburban windows whose subdivision morphology matches the
+existing United States list. The \emph{informal} expert trains on 24
+unplanned peri-urban frontier windows across Latin America, Africa,
+and South and Southeast Asia. The \emph{megacity} expert trains on 24
+saturated growth-edge windows of the largest cities, including four in
+the Delhi region, with a fifth Delhi window (Narela) held out for
+evaluation alongside one held-out window per new expert. OpenStreetMap
+coverage is uneven across these lists---building mapping is thin in
+the two Chinese windows and road mapping is thin in several informal
+ones---and the growth filter drops windows whose data cannot support a
+training pair, at the cost of samples rather than correctness.
+
+Routing remains a hard, ordered rule on conditioning statistics, for
+the reasons given in Section~\ref{sec:moe}, with one added feature:
+the ratio of road-pixel fraction to built fraction. Informal frontiers
+put up buildings faster than mapped roads and planned fringes do the
+opposite, so the ratio separates the two regimes where built fraction
+alone cannot. The rule list is evaluated first match first: a built
+fraction below 0.02 routes to the village expert; above 0.22, to the
+megacity expert; a built fraction above 0.10 with a roads-per-built
+ratio below 0.35, to the informal expert; a mean slope above the v4
+threshold, to the town expert; and the remaining flat, road-served
+windows to the urban expert. Scale therefore requires no additional
+mechanism: at a fixed 1.9\,km window, the difference between a village
+and a Delhi growth edge is precisely how full and how road-served the
+window is, which is what the routing features measure. A window in
+central Delhi is already saturated and routes to the megacity expert;
+the growth question this model answers applies to the edges, which is
+where the held-out window sits. Because deployments rarely carry all
+five checkpoints, each expert declares an ordered fallback chain and
+the dispatcher routes to the first substitute actually loaded,
+logging both the requested and the substituted expert; a two-expert
+deployment reproduces the v4 behaviour exactly. The caveats of the v4
+router carry over unchanged---a hard gate has no blending, and the
+thresholds encode our partition of the training data---joined by one
+new one: a window whose roads exist but are unmapped in OpenStreetMap
+is indistinguishable from an unplanned frontier in these statistics
+and will route to the informal expert. For routing purposes this is
+arguably the correct behaviour, since the model cannot condition on
+roads it cannot see, but the expert label should not be read as a
+claim about the settlement's legal or planning status.
+
+\subsection{Status}
+\label{sec:v5status}
+The five window lists, the extended router, the recalibrated amenity
+feature, the per-class abstention margins, and the reproduction
+protocol are merged and released, and all routing and abstention logic
+is covered by offline self-tests. The five training runs, the
+zone-classifier retrain, and the Middleburg Heights before/after
+counts are pending. We do not claim that the five-expert mixture
+outperforms the v4 configuration, or that the amenity recalibration
+repairs the documented failure, until those runs complete; the
+diagnosis of Section~\ref{sec:v5amenity} rests on code inspection and
+synthetic tests, which establish the mechanism but not the magnitude
+of the improvement.
+
 \section{Applications: towards automated city-building agents}
 \label{sec:applications}
 The sandbox mode is a decision-making layer for game automation: at each
@@ -824,7 +979,11 @@ fine detail.
 cycleway coverage thins outside Europe, so the scorecard's destination
 set is less complete in the Asian towns and the post-hoc classifiers are
 trained on European labels; leave-one-town-out transfer is tested only
-within that labelled pool.
+within that labelled pool. The v5 window lists extend this concern:
+road mapping is thin in several informal-frontier windows and building
+mapping is thin in the Chinese megacity windows, so the growth filter
+drops some of exactly the windows those experts most need, and the
+surviving informal windows over-represent the better-mapped frontiers.
 \textbf{Window scale.} 1.9\,km windows exclude transit-scale
 structure---tram or rail corridors, and anything that only makes sense
 at city scale---which is why transit appears in the scorecard only as a
@@ -850,16 +1009,31 @@ data pipeline, but the water-conditioned checkpoint has not finished
 training; the RePaint water/steep-slope lock is a deployment patch on
 the existing 4-channel model, not evidence the conditioning channel is
 unnecessary.
-\textbf{Mixture of experts untrained.} The two-expert architecture and
-router of Section~\ref{sec:moe} are implemented and the urban expert's
-data is assembled, but the urban expert has not been trained to
-convergence; we report no comparison between the mixture and the
-single mixed model.
+\textbf{Mixture of experts untrained.} The five-expert architecture,
+router, and window lists of Section~\ref{sec:v5moe} are implemented,
+but none of the five experts has been trained to convergence; we
+report no comparison between the mixture and the single mixed model,
+and the v4 two-expert comparison of Section~\ref{sec:moe} likewise
+never ran.
+\textbf{Router thresholds are a data partition.} The five-way routing
+thresholds of Section~\ref{sec:v5moe} were chosen from the
+training-window distributions, not learned or validated against an
+external definition of settlement type; a window whose roads are
+unmapped in OSM routes as informal regardless of its actual planning
+status.
+\textbf{Amenity recalibration invalidates earlier artefacts.} The
+absolute amenity scale of Section~\ref{sec:v5amenity} changes both a
+diffusion target channel and a classifier feature, so caches,
+checkpoints, and zone classifiers produced before the change cannot be
+mixed with v5 artefacts; cross-version comparisons require retraining
+the control, which the released protocol does.
 \textbf{Zoning classifier accuracy.} Leave-one-town-out macro-F1 for
 the typed-zone classifier is $\sim$0.30 even after the v4 changes of
 Section~\ref{sec:v4zoning}; abstention reduces the cost of being wrong
 but does not raise the underlying accuracy, and a low-F1 classifier
-should be read as indicative, not authoritative, zoning.
+should be read as indicative, not authoritative, zoning. Whether the
+v5 amenity recalibration improves this number is an open question
+pending the retrain.
 \textbf{Planner-tooling scope.} The natural-language operations layer
 of Section~\ref{sec:v4tools} covers a fixed, closed set of operations
 and a fixed region vocabulary; requests outside that vocabulary produce
@@ -881,8 +1055,14 @@ fifth conditioning channel for water, a two-expert mixture with an
 auditable router, and a planner-facing layer of region-locked
 inpainting, consensus maps, vector export, and validated
 natural-language operations move the pipeline further toward a tool a
-planner could actually use, with the water retrain and the urban expert
-still pending and named as such.
+planner could actually use. v5 widens the mixture to five experts
+spanning village, hilly town, planned fringe, informal frontier, and
+megacity edge---with 84 new windows across five continents and a
+Delhi-region hold-out---and corrects a diagnosed amenity-normalisation
+defect that had caused institutional over-prediction on sparse
+suburban fabric. The five training runs, the water retrain, and the
+before/after validation of the amenity correction remain pending and
+are named as such.
 
 \section*{AI assistance disclosure}
 The code, experiments, and text of this paper were produced with
