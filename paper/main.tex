@@ -42,9 +42,11 @@ planning office needs to use it: an eleven-metric sustainability
 scorecard with best-of-$N$ selection, a typed-zoning classifier with
 per-class abstention, demand forecasting from the same built-up epochs,
 compliance checking whose thresholds come from jurisdictional rule
-packs (data files citing the legal instruments they approximate, with
-seed packs for United States floodplain regulation and Swiss
-building-zone separation), synthesis of public comments into validated
+packs extracted from the planning documents a jurisdiction actually
+publishes (a zoning ordinance, a comprehensive plan, or a model-code
+excerpt, read by a deterministic pattern layer and an optional local
+language model, with every extracted value quoting the sentence it
+came from), synthesis of public comments into validated
 plan operations, and deterministic drafting of staff reports in which
 every sentence traces to a computed quantity. Natural-language control
 flows through a closed operation schema, and the language model behind
@@ -130,8 +132,9 @@ complement that forecasts built-area growth from the same epochs and
 scores candidates against the projected budget.
 \item A planning-task layer covering duties beyond generation: typed
 zoning with per-class abstention margins, compliance checking under
-jurisdictional rule packs that cite the legal instruments they
-approximate, lexicon-based synthesis of public comments into validated
+jurisdictional rule packs extracted from supplied planning documents
+with quoted evidence and strictest-wins merging, lexicon-based
+synthesis of public comments into validated
 plan operations, and deterministic staff-report drafting in which every
 sentence traces to a computed quantity.
 \item A language interface in which planner intent maps onto a closed,
@@ -293,10 +296,25 @@ curve, selects by residual error with a complexity penalty on the
 logistic, refuses horizons beyond twenty years, and converts the
 projection into a growth budget in pixels. Candidates are then also
 scored by closeness of delivered growth to the budget, as a rerank
-feature alongside the scorecard. Five points support only rough
+feature alongside the scorecard. Figure~\ref{fig:forecast} shows the
+model selection working as intended on the two regimes it was built
+for: a saturating series is fitted and capped by the logistic, and a
+steady series keeps its linear slope. Five points support only rough
 projections; the output carries its fit residual and a caution that
 the number is an order of magnitude, and the drafted reports repeat
 that caution.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.9\linewidth]{figures/fig_forecast.pdf}
+\caption{Forecast model selection on the two regimes the stage
+distinguishes, computed by the released module. Left: a saturating
+window; the logistic wins the penalised fit and the 2035 projection
+respects the carrying capacity instead of extrapolating a recent
+slope. Right: a steadily growing window; the line wins and the 2030
+projection continues it.}
+\label{fig:forecast}
+\end{figure}
 
 \section{Annotation stages}
 \label{sec:posthoc}
@@ -367,27 +385,49 @@ and that a staff read of the full record remains required.
 \subsection{Jurisdictional rule packs}
 \label{sec:packs}
 No single set of compliance thresholds is the law anywhere, so the
-applicable rules are an input rather than a constant. A rule pack is a
-small data file naming its jurisdiction, citing the legal instruments
-it draws from, carrying a mandatory statement of how to verify it
-locally, and setting the numeric thresholds the compliance checks
-accept. Two seed packs ship beside the pipeline default. The first
-reflects the one nearly universal rule of United States floodplain
-regulation, that communities in the National Flood Insurance Program
-must regulate development in Special Flood Hazard Areas (44 CFR Part
-60, sec.~60.3); under it, growth on mapped water is a permit matter
-rather than a hazard note, and a missing water mask is itself
-reported. The second reflects the Swiss planning act (RPG, SR 700,
-Art.~22 and 24), under which construction belongs inside designated
-building zones; the pack approximates the zone boundary by tightening
-the leapfrog ring. The proxies are named as proxies: a raster water
-mask is not a flood insurance rate map, and a distance ring is not a
-Nutzungsplan. Every findings list produced through a pack ends with a
-provenance note naming the pack, its citations, and its verification
-statement, so a report cannot silently convert an approximation into a
-legal determination. Packs validate against a schema that rejects
-uncited jurisdictional claims and out-of-range thresholds, and new
-jurisdictions are added by writing a JSON file, not by forking code.
+applicable rules are an input rather than a constant, and the pipeline
+obtains them by reading the documents a jurisdiction actually
+publishes: a zoning ordinance, a comprehensive plan, a hillside or
+floodplain chapter, or an excerpt of a model code such as the
+International Building Code. No code text is bundled with the
+pipeline; model codes are copyrighted and local amendments control in
+any case, so the caller supplies the text and the extractor works from
+exactly what it was given.
+
+Extraction runs in two layers over the same text. A deterministic
+sentence-level extractor recognises the recurring numeric patterns of
+planning English: slopes exceeding a stated percentage or degree
+figure, required separations between industrial and residential uses,
+contiguity requirements that cap the distance of new development from
+existing services, and floodplain permit language. It works offline
+and its patterns are inspectable. A language model, reached through
+the same pluggable backend as the operation parser, reads the document
+chunk by chunk against a fixed JSON schema over the same closed set of
+rule keys and proposes further candidates. Both layers emit
+candidates, never conclusions. Every candidate must carry the verbatim
+sentence it came from; candidates merge under a strictest-wins rule
+(the lowest slope limit, the widest separation, the tightest
+contiguity distance); merged values pass the same range validation as
+hand-written packs, and a value outside its plausible range is dropped
+with a warning rather than clamped, since a clamped number would
+misquote the document. The result is a rule pack: a small data file
+naming its source document, quoting the provisions it read, marked at
+the ``extracted'' level, and stating in its own verification text that
+every value must be confirmed against the document before reliance.
+An extracted number is a reading aid; the document remains the
+authority.
+
+Every findings list produced through a pack ends with a provenance
+note naming the pack, its level, its quoted evidence, and its
+verification statement, so a report cannot silently convert a machine
+reading into a legal determination. When a pack marks flood areas as
+regulated, growth on mapped water is escalated from a hazard note to a
+permit matter, and a missing water mask is itself reported as an
+unchecked regulated layer. Hand-written packs remain supported through
+the same schema at a ``manual'' level, which requires citations and a
+verification statement just as extracted packs do; the schema rejects
+uncited jurisdictional claims and out-of-range thresholds regardless
+of how the pack was produced.
 
 \subsection{Compliance checking}
 At 15\,m per pixel there are no setbacks or parking counts, so the
@@ -440,26 +480,29 @@ measurement.
 
 \subsection{Training}
 All five experts trained to 300 epochs on a single T4 GPU with no
-divergence. Final noise-prediction losses order by morphological
-complexity: village 0.024, town 0.028, urban 0.032, informal 0.038,
-megacity 0.042. An earlier single-model run on the temporal pairs
-converged from 0.744 to $\sim$0.040 over 120 epochs
-(Figure~\ref{fig:loss}); training loss is evidence of learnability,
-not a fidelity claim. On the five held-out windows (Wengen, Gubbio,
-Des Moines, Antananarivo, Delhi-Narela) the router selected the
-intended expert in every case. Not every channel learned: the road
-channel, supervised as a 1-pixel line, does not reach the spatial
-coherence of the density and amenity channels (neighbour correlation
-$\sim$0.26 against $\sim$0.98), the deployment hides it, and
-road-target dilation is the identified but untested fix.
+divergence. Figure~\ref{fig:losses} shows the five per-epoch loss
+histories; the final noise-prediction losses order by morphological
+complexity (village 0.024, town 0.028, urban 0.032, informal 0.038,
+megacity 0.042), and the ordering holds across most of training, not
+only at the end. An earlier single-model run on the temporal pairs
+converged from 0.744 to $\sim$0.040 over 120 epochs with the same
+profile; training loss is evidence of learnability, not a fidelity
+claim. On the five held-out windows (Wengen, Gubbio, Des Moines,
+Antananarivo, Delhi-Narela) the router selected the intended expert in
+every case. Not every channel learned: the road channel, supervised as
+a 1-pixel line, does not reach the spatial coherence of the density
+and amenity channels (neighbour correlation $\sim$0.26 against
+$\sim$0.98), the deployment hides it, and road-target dilation is the
+identified but untested fix.
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=0.62\linewidth]{figures/loss_curve.pdf}
-\caption{Noise-prediction MSE (log scale) for the single-model
-temporal-supervision run: 0.744 at epoch 1 to $\sim$0.040 at epoch
-120. The five v5 experts show the same profile.}
-\label{fig:loss}
+\includegraphics[width=0.72\linewidth]{figures/fig_losses.pdf}
+\caption{Per-epoch noise-prediction loss (log scale) for the five
+experts over 300 epochs, from the recorded training histories. The
+curves separate by morphological complexity early and keep that order:
+the village expert converges lowest and the megacity expert highest.}
+\label{fig:losses}
 \end{figure}
 
 \subsection{Selection behaviour}
@@ -501,16 +544,34 @@ classifiers on the expanded training distribution, one under the old
 normalisation as a control and one under the absolute calibration. The
 failure did not reproduce under either: institutional counts were 203
 and 221 of roughly 4{,}300 typed advisory cells respectively, both
-near 5\%, and macro-F1 was identical to three decimal places. The
-repair therefore came from the training data, not the feature
-calibration, which is retained on measurement-consistency grounds. The
-per-class margin behaves monotonically, with institutional assignments
-falling 221, 104, 32, 1 as the margin rises through 0, 0.5, 1.0, 2.0
-and every other class unchanged; 0.5 is the deployed default. The
-dense in-distribution check did not regress: Gubbio's advisory typing
-is identical under every variant. What the protocol cannot isolate is
-the originally deployed classifier itself, whose cache predates the
-expanded lists; the 43\% figure rests on the deployment observation.
+near 5\% against the original 43\%
+(Figure~\ref{fig:middleburg}, left), and macro-F1 was identical to
+three decimal places. The repair therefore came from the training
+data, not the feature calibration, which is retained on
+measurement-consistency grounds. The per-class margin behaves
+monotonically, with institutional assignments falling 221, 104, 32, 1
+as the margin rises through 0, 0.5, 1.0, 2.0 and every other class
+unchanged (Figure~\ref{fig:middleburg}, right); 0.5 is the deployed
+default. The dense in-distribution check did not regress: Gubbio's
+advisory typing is identical under every variant. What the protocol
+cannot isolate is the originally deployed classifier itself, whose
+cache predates the expanded lists; the 43\% figure rests on the
+deployment observation.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.48\linewidth]{figures/fig_middleburg.pdf}\hfill
+\includegraphics[width=0.48\linewidth]{figures/fig_margin_sweep.pdf}
+\caption{The Middleburg Heights experiment. Left: share of advisory
+cells typed institutional in the original deployment observation and
+in the two retrained classifiers (old features as control, absolute
+amenity calibration); the control repairs the failure on its own,
+which is what makes the result negative for the calibration
+hypothesis. Right: institutional advisory count under the per-class
+abstention margin sweep; every other class is unchanged at every
+setting.}
+\label{fig:middleburg}
+\end{figure}
 
 \subsection{Deployment}
 The full stack runs client-side in a browser: each expert exports to a
@@ -589,12 +650,17 @@ horizons and labels its outputs as order-of-magnitude, and both
 properties are load-bearing.
 \textbf{Comment synthesis.} A lexicon; sarcasm, cross-clause negation,
 and non-English comments defeat it, and the output says so.
-\textbf{Rule packs.} The seed packs are illustrative approximations of
-two well-documented regimes, not adopted local codes; a raster mask is
-not a flood map and a ring is not a zone plan, and the provenance note
-in every findings list exists precisely because those substitutions
-must stay visible. No pack has been reviewed by an authority of the
-jurisdiction it names.
+\textbf{Rule extraction.} The deterministic extractor reads only the
+sentence patterns it was written for, and its recall and precision on
+a corpus of real ordinances have not been measured; the language-model
+layer inherits whatever reading errors its backend makes, which is why
+both layers must quote their evidence and why extracted packs demand
+confirmation against the document. A quoted sentence is not an
+interpretation: definitions, exceptions, overlays, and amendments
+elsewhere in a code can change what a number means, a raster mask is
+not a flood map, and a distance ring is not a zone plan. No extracted
+pack has been reviewed by an authority of the jurisdiction whose
+document it read.
 \textbf{Report drafting.} Deterministic templates trade fluency for
 traceability; the recommendation rule is mechanical and binds no one.
 \textbf{Scorecard scope.} Spatial-form proxies; no zoning law, land
@@ -610,7 +676,8 @@ evaluated a pipeline that covers the automatable subset of those
 duties for settlement growth: five terrain-conditioned diffusion
 experts routed by an auditable rule, scorecard evaluation with
 demand-aware selection, abstaining zoning annotation, compliance under
-citable jurisdictional rule packs, public comment synthesis into a
+rule packs extracted with quoted evidence from the planning documents
+jurisdictions publish, public comment synthesis into a
 closed operation schema, deterministic staff-report drafting, and a
 pluggable language interface defaulting to a locally served model. The
 measured results include converged training across five growth
