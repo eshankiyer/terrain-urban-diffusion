@@ -83,16 +83,19 @@ def _words(text):
     return out
 
 
-_NEGATION_RE = re.compile(r"\b(?:not|never|no\s+longer)\b|n't",
-                          re.IGNORECASE)
+_NEGATION_RE = re.compile(
+    r"\b(?:not|never|no\s+longer|no\s+more|no\s+new)\b|n't",
+    re.IGNORECASE)
 
 
 def _drop_negated_clauses(text):
     """Remove clauses that contain an explicit negation marker.
 
     parse_intent cannot see negation, so "do not protect the hillside"
-    would otherwise invert into a Protect op. Clauses (split on . , ; !
-    and ?) containing not, n't, never, or "no longer" are dropped before
+    would otherwise invert into a Protect op, and "no more factories"
+    would invert into a bias toward industrial because "more" is a
+    positive trigger. Clauses (split on . , ; ! and ?) containing not,
+    n't, never, "no longer", "no more", or "no new" are dropped before
     op extraction. Returns (kept_text, n_dropped).
     """
     raw = str(text)
@@ -250,7 +253,7 @@ if __name__ == "__main__":
         "Please protect the floodplain, we flood every spring.",
         "Protect the floodplain! My basement has flooded twice.",
         "We need a school in the north part of town.",
-        "A school in the north would help; add one.",
+        "Please add a school in the north.",
         "Against this. It will ruin the neighbourhood character.",
         "No more factories near homes. Reduce industrial everywhere.",
         "Sidewalks please, the kids walk to the park.",
