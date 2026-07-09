@@ -149,6 +149,138 @@ picks one per window and the status line reports which.</p>
   <button id="nl-apply">apply</button>
 </div>
 
+<h2>Read the rules from your planning document</h2>
+<p class="steps">Paste text from a zoning ordinance, comprehensive plan,
+or model-code excerpt (for example your jurisdiction's adopted version of
+the International Building Code; no code text ships with this site). A
+deterministic reader extracts the numeric development rules it
+recognises, quotes the sentence each number came from, merges duplicates
+under a strictest-wins rule, and can apply an extracted slope limit to
+the steep lock above. This is a machine reading, not an interpretation:
+confirm every value against the document. The full extractor, including
+an optional local language-model layer and the compliance checks the
+rules feed, is <code>src/jurisdiction.py</code> in the repository.</p>
+<textarea id="rule-doc" rows="6" style="width:100%;box-sizing:border-box"
+placeholder="e.g. 'No structure shall be erected on slopes exceeding 15 percent. A buffer of at least 100 feet shall be maintained between industrial uses and any residential district.'"></textarea>
+<div class="toolbar" style="margin-top:8px">
+  <button id="rule-extract" class="primary">extract rules</button>
+  <label style="margin-left:10px"><input type="checkbox" id="rule-apply-slope" checked>
+  apply extracted slope limit to the steep lock</label>
+</div>
+<div id="rule-out" class="legend" style="min-height:1.4em"></div>
+<script>
+/* JS port of the deterministic layer of src/jurisdiction.py
+   (extract_rules_regex + merge_candidates): same sentence patterns,
+   same strictest-wins merge, same plausibility ranges. Out-of-range
+   values are dropped with a warning, never clamped, since a clamped
+   number would misquote the document. The language-model layer and the
+   compliance checks run in the Python pipeline, not here. */
+(function(){
+window.RULE_SLOPE_DEG = 25;
+var FT_M = 0.3048;
+var RANGES = {slope_limit_deg:[1,60], industrial_buffer_m:[0,600],
+              leapfrog_max_m:[15,1500]};
+var SLOPE_RE = /slopes?\s+(?:of\s+)?(?:exceeding|greater\s+than|steeper\s+than|over|above|in\s+excess\s+of)\s+(\d+(?:\.\d+)?)\s*(percent|%|degrees?)/i;
+var DIST_RE = /(\d+(?:\.\d+)?)\s*(feet|foot|ft|metres?|meters?|m)\b/i;
+var FLOOD_RE = /special\s+flood\s+hazard|floodplain\s+(?:development\s+)?permit|flood\s+damage\s+prevention|regulatory\s+floodway/i;
+var CONTIG_RE = /contiguous|adjacent\s+to\s+existing|urban\s+growth\s+boundary|within\s+.{0,30}\s+of\s+existing\s+(?:development|urban)/i;
+function toM(v,u){ return /^f/i.test(u) ? v*FT_M : v; }
+function toDeg(v,u){ return /^deg/i.test(u) ? v : Math.atan(v/100)*180/Math.PI; }
+function sentences(t){
+  return String(t).replace(/\n{2,}/g, ". ").split(/(?<=[.;])\s+/)
+    .map(function(s){ return s.replace(/\s+/g," ").trim(); })
+    .filter(Boolean);
+}
+function extract(t){
+  var c = [];
+  sentences(t).forEach(function(s){
+    var low = s.toLowerCase();
+    var m = SLOPE_RE.exec(s);
+    if (m) c.push({key:"slope_limit_deg",
+                   value:toDeg(parseFloat(m[1]), m[2]), quote:s});
+    if (low.indexOf("industrial")>=0 &&
+        (low.indexOf("residential")>=0 || low.indexOf("dwelling")>=0)) {
+      var d = DIST_RE.exec(s);
+      if (d && ["buffer","setback","separation","separated","screening",
+                "distance"].some(function(w){return low.indexOf(w)>=0;}))
+        c.push({key:"industrial_buffer_m",
+                value:toM(parseFloat(d[1]), d[2]), quote:s});
+    }
+    if (CONTIG_RE.test(s)) {
+      var d2 = DIST_RE.exec(s);
+      if (d2) c.push({key:"leapfrog_max_m",
+                      value:toM(parseFloat(d2[1]), d2[2]), quote:s});
+    }
+    if (FLOOD_RE.test(s))
+      c.push({key:"water_regulated", value:true, quote:s});
+  });
+  return c;
+}
+function merge(cands){
+  var strict = {slope_limit_deg:Math.min, industrial_buffer_m:Math.max,
+                leapfrog_max_m:Math.min};
+  var rules = {}, ev = [], warns = [];
+  cands.forEach(function(c){
+    if (c.key === "water_regulated") {
+      if (c.value) { rules[c.key] = true; ev.push(c); }
+      return;
+    }
+    var r = RANGES[c.key], lo = r[0], hi = r[1];
+    if (!(c.value >= lo && c.value <= hi)) {
+      warns.push("dropped " + c.key + "=" + c.value.toFixed(1) +
+                 " (outside " + lo + ".." + hi + "): not applied");
+      return;
+    }
+    if (!(c.key in rules) || strict[c.key](rules[c.key], c.value) === c.value)
+      rules[c.key] = c.value;
+    ev.push(c);
+  });
+  return {rules:rules, ev:ev, warns:warns};
+}
+document.getElementById("rule-extract").addEventListener("click", function(){
+  var out = document.getElementById("rule-out");
+  var res = merge(extract(document.getElementById("rule-doc").value));
+  var rules = res.rules, lines = [];
+  var fmt = {
+    slope_limit_deg: function(v){ return "slope limit " + v.toFixed(1) + "°"; },
+    industrial_buffer_m: function(v){ return "industrial/residential separation " + v.toFixed(0) + " m"; },
+    leapfrog_max_m: function(v){ return "max distance from existing development " + v.toFixed(0) + " m"; },
+    water_regulated: function(){ return "flood areas are a permit matter"; }
+  };
+  Object.keys(rules).forEach(function(k){
+    var q = "";
+    for (var i = 0; i < res.ev.length; i++)
+      if (res.ev[i].key === k) { q = res.ev[i].quote; break; }
+    lines.push("<b>" + fmt[k](rules[k]) + "</b><br><i>“" +
+               q.replace(/</g,"&lt;").slice(0,180) + "”</i>");
+  });
+  res.warns.forEach(function(w){
+    lines.push('<span style="color:#b23b3b">' + w + "</span>");
+  });
+  if (!lines.length) {
+    out.innerHTML = "no extractable rules found in this text; the reader " +
+      "recognises slope limits, industrial/residential separations, " +
+      "contiguity distances, and floodplain permit language";
+    window.RULE_SLOPE_DEG = 25;
+    return;
+  }
+  if (rules.slope_limit_deg != null &&
+      document.getElementById("rule-apply-slope").checked) {
+    window.RULE_SLOPE_DEG = rules.slope_limit_deg;
+    lines.push("the steep lock will use " +
+               window.RULE_SLOPE_DEG.toFixed(1) +
+               "° on the next run (site default 25°); the other " +
+               "values feed the Python compliance layer, not this display");
+  } else {
+    window.RULE_SLOPE_DEG = 25;
+    lines.push("values shown are a machine reading; the compliance " +
+               "checks that consume them run in the Python pipeline");
+  }
+  out.innerHTML = lines.join("<br><br>");
+});
+})();
+</script>
+
 <h2>What you are looking at</h2>
 <p>The model is a mixture of five compact conditional U-Nets (~13M
 parameters each), one per growth regime: village, hilly town, planned
@@ -793,7 +925,7 @@ async function generate() {
       + (used !== expert ? " (using " + used + ", nearest published)" : "") + "…";
     // STEEP LOCK: slope > 25 deg (landslide-proxy threshold, see steepMask)
     // joins the RePaint keepMask like parks -- locked to -1 = no growth.
-    const steep = steepMask(elev, 25);
+    const steep = steepMask(elev, (window.RULE_SLOPE_DEG||25));
     /* region-locked regeneration: your drawn roads/built are re-injected at
        their encoded values (2*v-1) at every DDIM step, so the plan is
        preserved verbatim; green park and steep-slope pixels are locked to
@@ -1217,7 +1349,7 @@ growBtn.onclick = async () => {
     const n = G*G;
     // STEEP LOCK: slope > 25 deg (landslide-proxy threshold, see steepMask)
     // from the real fetched elevation, same idea as the water lock below.
-    const steep = steepMask(elev, 25);
+    const steep = steepMask(elev, (window.RULE_SLOPE_DEG||25));
     let anchor = 0, waterN = 0, steepOrWaterN = 0;
     for (let i = 0; i < n; i++) {
       if (osm.built[i] || osm.roads[i]) anchor++;
